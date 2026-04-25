@@ -1,0 +1,55 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Home + Security",
+        "description": "Configure app endpoints, then continue to Netatmo portal login.",
+        "data": {
+          "client_id": "Client ID",
+          "client_secret": "Client Secret",
+          "app_version": "App version",
+          "app_type": "App type",
+          "scope": "OAuth scope",
+          "token_url": "Token URL",
+          "api_base_url": "API base URL",
+          "ws_url": "Websocket URL",
+          "turn_url": "TURN URL"
+        }
+      },
+      "select_home": {
+        "title": "Select Home",
+        "description": "Multiple compatible homes were found. Choose which home to sync.",
+        "data": {
+          "home_id": "Home"
+        }
+      }
+    },
+    "error": {
+      "invalid_home": "The selected home is invalid. Please try again."
+    },
+    "abort": {
+      "single_instance_allowed": "Only a single Home + Security configuration is allowed.",
+      "no_homes": "Home discovery state was lost. Restart setup.",
+      "user_rejected_authorize": "Authorization was rejected in the portal.",
+      "oauth_failed": "OAuth login failed.",
+      "cannot_connect": "Could not connect to Home + Security endpoints.",
+      "no_bncx_homes": "No home with a Classe 300EOS (BNCX) module was found on this account."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Home + Security options",
+        "data": {
+          "app_version": "App version",
+          "app_type": "App type",
+          "scope": "OAuth scope",
+          "token_url": "Token URL",
+          "api_base_url": "API base URL",
+          "ws_url": "Websocket URL",
+          "turn_url": "TURN URL"
+        }
+      }
+    }
+  }
+}
