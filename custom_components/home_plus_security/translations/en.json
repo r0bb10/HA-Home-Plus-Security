@@ -3,18 +3,7 @@
     "step": {
       "user": {
         "title": "Home + Security",
-        "description": "Configure app endpoints, then continue to Netatmo portal login.",
-        "data": {
-          "client_id": "Client ID",
-          "client_secret": "Client Secret",
-          "app_version": "App version",
-          "app_type": "App type",
-          "scope": "OAuth scope",
-          "token_url": "Token URL",
-          "api_base_url": "API base URL",
-          "ws_url": "Websocket URL",
-          "turn_url": "TURN URL"
-        }
+        "description": "Connect your Home + Security account to continue."
       },
       "select_home": {
         "title": "Select Home",

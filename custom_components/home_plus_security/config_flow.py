@@ -78,15 +78,13 @@ class HomePlusSecurityFlowHandler(ConfigFlow, domain=DOMAIN):
         if self._async_current_entries():
             return self.async_abort(reason="single_instance_allowed")
 
-        defaults = user_input or {}
-
         if user_input is not None:
-            self._pending_input = user_input
+            self._pending_input = _default_user_input()
             return await self.async_step_auth()
 
         return self.async_show_form(
             step_id="user",
-            data_schema=_build_user_schema(defaults),
+            data_schema=vol.Schema({}),
             errors={},
         )
 
@@ -206,15 +204,24 @@ class HomePlusSecurityFlowHandler(ConfigFlow, domain=DOMAIN):
 
         choices: list[dict[str, str]] = []
         for home in homes:
-            bncx = extract_home_bnc_module(home)
-            if not bncx:
-                continue
-
             home_id = str(home.get("id", "")).strip()
             if not home_id:
                 continue
 
             home_name = str(home.get("name", home_id)).strip() or home_id
+            bncx = extract_home_bnc_module(home)
+
+            # Some token contexts may return homes without full module topology in homesdata.
+            # Fallback to homestatus lookup before excluding the home.
+            if not bncx:
+                try:
+                    homestatus = await client.async_get_homestatus(home_id)
+                except HomePlusSecurityApiError:
+                    homestatus = {}
+                bncx = extract_bncx_from_homestatus(homestatus)
+                if not bncx:
+                    continue
+
             bncx_name = str(bncx.get("name", bncx.get("id", "BNCX"))).strip()
             choices.append({CONF_HOME_ID: home_id, CONF_HOME_NAME: f"{home_name} ({bncx_name})"})
 
@@ -283,22 +290,46 @@ class HomePlusSecurityOptionsFlow(OptionsFlow):
 
 
 def _build_user_schema(defaults: dict[str, Any]) -> vol.Schema:
-    """Build schema with sticky defaults."""
-    return vol.Schema(
-        {
-            vol.Required(CONF_CLIENT_ID, default=str(defaults.get(CONF_CLIENT_ID, DEFAULT_CLIENT_ID))): str,
-            vol.Required(CONF_CLIENT_SECRET, default=str(defaults.get(CONF_CLIENT_SECRET, DEFAULT_CLIENT_SECRET))): str,
-            vol.Required(CONF_APP_VERSION, default=str(defaults.get(CONF_APP_VERSION, DEFAULT_APP_VERSION))): str,
-            vol.Required(CONF_APP_TYPE, default=str(defaults.get(CONF_APP_TYPE, DEFAULT_APP_TYPE))): str,
-            vol.Required(CONF_SCOPE, default=str(defaults.get(CONF_SCOPE, DEFAULT_SCOPE))): str,
-            vol.Required(CONF_TOKEN_URL, default=str(defaults.get(CONF_TOKEN_URL, DEFAULT_TOKEN_URL))): str,
-            vol.Required(CONF_API_BASE_URL, default=str(defaults.get(CONF_API_BASE_URL, DEFAULT_API_BASE_URL))): str,
-            vol.Required(CONF_WS_URL, default=str(defaults.get(CONF_WS_URL, DEFAULT_WS_URL))): str,
-            vol.Required(CONF_TURN_URL, default=str(defaults.get(CONF_TURN_URL, DEFAULT_TURN_URL))): str,
-        }
-    )
+    """Deprecated helper retained for backwards compatibility."""
+    return vol.Schema({})
+
+
+def _default_user_input() -> dict[str, Any]:
+    """Return internal defaults used for official-style setup UX."""
+    return {
+        CONF_CLIENT_ID: DEFAULT_CLIENT_ID,
+        CONF_CLIENT_SECRET: DEFAULT_CLIENT_SECRET,
+        CONF_APP_VERSION: DEFAULT_APP_VERSION,
+        CONF_APP_TYPE: DEFAULT_APP_TYPE,
+        CONF_SCOPE: DEFAULT_SCOPE,
+        CONF_TOKEN_URL: DEFAULT_TOKEN_URL,
+        CONF_API_BASE_URL: DEFAULT_API_BASE_URL,
+        CONF_WS_URL: DEFAULT_WS_URL,
+        CONF_TURN_URL: DEFAULT_TURN_URL,
+    }
 
 
 def extract_home_bnc_module(home: dict[str, Any]) -> dict[str, Any] | None:
     """Return BNCX module from home metadata."""
     return extract_home_bncx_module(home)
+
+
+def extract_bncx_from_homestatus(homestatus: dict[str, Any]) -> dict[str, Any] | None:
+    """Return BNCX module from homestatus payload."""
+    body = homestatus.get("body")
+    if not isinstance(body, dict):
+        return None
+
+    home = body.get("home")
+    if not isinstance(home, dict):
+        return None
+
+    modules = home.get("modules")
+    if not isinstance(modules, list):
+        return None
+
+    for module in modules:
+        if isinstance(module, dict) and module.get("type") == "BNCX":
+            return module
+
+    return None
