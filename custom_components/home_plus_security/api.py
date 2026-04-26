@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
-from aiohttp import ClientError, ClientResponse
+from aiohttp import ClientConnectionError, ClientConnectorDNSError, ClientError, ClientResponse, ServerTimeoutError
 from aiohttp.client import ClientSession
 
 from .const import (
@@ -17,6 +18,10 @@ from .const import (
 )
 
 TokenUpdateCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
+
+API_RETRY_ATTEMPTS = 3
+API_RETRY_BASE_DELAY_SECONDS = 0.75
+AUTH_RETRY_STATUSES = {401, 403}
 
 
 class HomePlusSecurityApiError(Exception):
@@ -89,7 +94,7 @@ class HomePlusSecurityApiClient:
         await self.async_ensure_token()
         response = await self._async_api_get(endpoint)
 
-        if response.status != 401:
+        if response.status not in AUTH_RETRY_STATUSES:
             return await self._async_handle_json_response(response)
 
         response.release()
@@ -105,10 +110,15 @@ class HomePlusSecurityApiClient:
             "User-Agent": "okhttp/4.12.0",
         }
 
-        try:
-            return await self._session.get(url, headers=headers)
-        except ClientError as err:
-            raise HomePlusSecurityApiError(f"HTTP error while requesting {url}") from err
+        for attempt in range(1, API_RETRY_ATTEMPTS + 1):
+            try:
+                return await self._session.get(url, headers=headers)
+            except (ClientConnectorDNSError, ClientConnectionError, ServerTimeoutError, asyncio.TimeoutError, OSError) as err:
+                if attempt >= API_RETRY_ATTEMPTS:
+                    raise HomePlusSecurityApiError(f"Transient network error while requesting {url}") from err
+                await asyncio.sleep(API_RETRY_BASE_DELAY_SECONDS * attempt)
+            except ClientError as err:
+                raise HomePlusSecurityApiError(f"HTTP error while requesting {url}") from err
 
     async def _async_refresh_token(self) -> None:
         if not self._refresh_token:
