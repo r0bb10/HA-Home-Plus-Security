@@ -39,7 +39,7 @@ from .const import (
 from .coordinator import HomePlusSecurityDataUpdateCoordinator
 from .device import build_device_info
 
-PLATFORMS: list[str] = ["sensor", "binary_sensor"]
+PLATFORMS: list[str] = ["sensor", "binary_sensor", "button"]
 HomePlusSecurityConfigEntry = ConfigEntry
 
 
