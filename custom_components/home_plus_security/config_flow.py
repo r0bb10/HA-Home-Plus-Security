@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+import logging
 from typing import Any
 
 from aiohttp import ClientError
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult, OptionsFlow
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntry, ConfigFlowResult
 from homeassistant.core import callback
+from homeassistant.helpers import config_entry_oauth2_flow
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.config_entry_oauth2_flow import (
     LocalOAuth2Implementation,
@@ -23,94 +26,99 @@ from .api import (
     HomePlusSecurityAuthError,
     extract_home_bncx_module,
     extract_homes,
+    normalize_scope,
 )
 from .const import (
     CONF_ACCESS_TOKEN,
     CONF_API_BASE_URL,
-    CONF_APP_TYPE,
-    CONF_APP_VERSION,
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
     CONF_HOME_ID,
     CONF_HOME_NAME,
-    CONF_PASSWORD,
     CONF_REFRESH_TOKEN,
     CONF_SCOPE,
     CONF_TOKEN_URL,
-    CONF_TURN_URL,
-    CONF_USERNAME,
-    CONF_WS_URL,
     DEFAULT_API_BASE_URL,
     DEFAULT_APP_TYPE,
-    DEFAULT_APP_VERSION,
     DEFAULT_CLIENT_ID,
     DEFAULT_CLIENT_SECRET,
     DEFAULT_SCOPE,
     DEFAULT_TOKEN_URL,
-    DEFAULT_TURN_URL,
-    DEFAULT_WS_URL,
     DOMAIN,
     NAME,
+    REQUIRED_SECURITY_SCOPE,
 )
 
+_LOGGER = logging.getLogger(__name__)
 APP_AUTHORIZE_URL = "https://app.netatmo.net/oauth2/authorize"
+_IMPL_KEY = f"{DOMAIN}_local"
+_DATA_LOCAL_IMPL_REGISTERED = f"{DOMAIN}_local_impl_registered"
 
 
-class HomePlusSecurityFlowHandler(ConfigFlow, domain=DOMAIN):
+class HomePlusSecurityOAuth2Implementation(LocalOAuth2Implementation):
+    """OAuth2 implementation that enforces app-security authorize params."""
+
+    @property
+    def name(self) -> str:
+        """Name shown by implementation picker."""
+        return NAME
+
+    @property
+    def extra_authorize_data(self) -> dict:
+        """Append required app-security OAuth authorize params."""
+        return {
+            "scope": DEFAULT_SCOPE,
+            "app_type": DEFAULT_APP_TYPE,
+        }
+
+
+class HomePlusSecurityFlowHandler(
+    config_entry_oauth2_flow.AbstractOAuth2FlowHandler, domain=DOMAIN
+):
     """Handle Home + Security config flow."""
 
+    DOMAIN = DOMAIN
     VERSION = 1
 
     def __init__(self) -> None:
-        """Initialize flow handler state."""
-        self._pending_input: dict[str, Any] | None = None
+        """Initialize flow state."""
+        super().__init__()
         self._home_choices: list[dict[str, str]] = []
-        self._external_data: dict[str, Any] | None = None
+        self._entry_data: dict[str, Any] | None = None
+        self._hps_reauth_entry_id: str | None = None
 
-    @staticmethod
-    @callback
-    def async_get_options_flow(config_entry):
-        """Get options flow."""
-        return HomePlusSecurityOptionsFlow(config_entry)
+    @property
+    def logger(self) -> logging.Logger:
+        """Return logger."""
+        return _LOGGER
 
-    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle user step."""
-        if self._async_current_entries():
-            return self.async_abort(reason="single_instance_allowed")
+        self._ensure_local_oauth_impl_registered()
+        return await super().async_step_user(user_input)
 
-        if user_input is not None:
-            self._pending_input = _default_user_input()
-            return await self.async_step_auth()
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Perform reauth upon an API authentication error."""
+        self._hps_reauth_entry_id = self.context.get("entry_id")
+        return await self.async_step_reauth_confirm()
 
-        return self.async_show_form(
-            step_id="user",
-            data_schema=vol.Schema({}),
-            errors={},
-        )
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Dialog that informs the user that reauth is required."""
+        if user_input is None:
+            return self.async_show_form(step_id="reauth_confirm")
 
-    async def async_step_auth(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
-        """Start/handle external OAuth callback."""
-        if not self._pending_input:
-            return self.async_abort(reason="oauth_failed")
+        return await self.async_step_user()
 
-        if user_input is not None:
-            self._external_data = user_input
-            next_step = "authorize_rejected" if "error" in user_input else "finish_auth"
-            return self.async_external_step_done(next_step_id=next_step)
-
-        implementation = self._build_oauth_implementation(self._pending_input)
-        url = await implementation.async_generate_authorize_url(self.flow_id)
-        return self.async_external_step(step_id="auth", url=url)
-
-    async def async_step_finish_auth(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
-        """Exchange OAuth code for tokens and continue setup."""
-        if not self._pending_input or not self._external_data:
-            return self.async_abort(reason="oauth_failed")
-
-        try:
-            implementation = self._build_oauth_implementation(self._pending_input)
-            token = await implementation.async_resolve_external_data(self._external_data)
-        except (OAuth2TokenRequestError, ClientError):
+    async def async_oauth_create_entry(self, data: dict) -> ConfigFlowResult:
+        """Create config entry from OAuth token after validation."""
+        token = data.get("token")
+        if not isinstance(token, dict):
             return self.async_abort(reason="oauth_failed")
 
         access_token = token.get("access_token")
@@ -118,12 +126,19 @@ class HomePlusSecurityFlowHandler(ConfigFlow, domain=DOMAIN):
         if not isinstance(access_token, str) or not isinstance(refresh_token, str):
             return self.async_abort(reason="oauth_failed")
 
-        self._pending_input[CONF_ACCESS_TOKEN] = access_token
-        self._pending_input[CONF_REFRESH_TOKEN] = refresh_token
+        token_scopes = normalize_scope(token.get("scope"))
+        if REQUIRED_SECURITY_SCOPE not in token_scopes:
+            return self.async_abort(reason="wrong_scope")
+
+        entry_data = _default_entry_data()
+        entry_data[CONF_ACCESS_TOKEN] = access_token
+        entry_data[CONF_REFRESH_TOKEN] = refresh_token
+        if token_scopes:
+            entry_data[CONF_SCOPE] = " ".join(sorted(token_scopes))
 
         try:
-            homes = await self._async_fetch_supported_homes(self._pending_input)
-        except HomePlusSecurityAuthError:
+            homes = await self._async_fetch_supported_homes(entry_data)
+        except (OAuth2TokenRequestError, HomePlusSecurityAuthError, ClientError):
             return self.async_abort(reason="oauth_failed")
         except HomePlusSecurityApiError:
             return self.async_abort(reason="cannot_connect")
@@ -131,32 +146,39 @@ class HomePlusSecurityFlowHandler(ConfigFlow, domain=DOMAIN):
         if not homes:
             return self.async_abort(reason="no_bncx_homes")
         if len(homes) == 1:
-            return await self._async_create_entry_for_home(self._pending_input, homes[0])
+            return await self._async_create_or_update_entry(entry_data, homes[0])
 
+        self._entry_data = entry_data
         self._home_choices = homes
         return await self.async_step_select_home()
 
-    async def async_step_authorize_rejected(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
-        """Handle external auth rejection."""
-        return self.async_abort(reason="user_rejected_authorize")
-
-    async def async_step_select_home(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+    async def async_step_select_home(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Select home when account has multiple supported homes."""
-        if not self._pending_input or not self._home_choices:
+        if not self._entry_data or not self._home_choices:
             return self.async_abort(reason="no_homes")
 
         errors: dict[str, str] = {}
-
         if user_input is not None:
             selected_home_id = str(user_input.get(CONF_HOME_ID, ""))
-            selected = next((home for home in self._home_choices if home[CONF_HOME_ID] == selected_home_id), None)
+            selected = next(
+                (
+                    home
+                    for home in self._home_choices
+                    if home[CONF_HOME_ID] == selected_home_id
+                ),
+                None,
+            )
             if selected is None:
                 errors["base"] = "invalid_home"
             else:
-                return await self._async_create_entry_for_home(self._pending_input, selected)
+                return await self._async_create_or_update_entry(self._entry_data, selected)
 
-        options = [{"value": home[CONF_HOME_ID], "label": home[CONF_HOME_NAME]} for home in self._home_choices]
-
+        options = [
+            {"value": home[CONF_HOME_ID], "label": home[CONF_HOME_NAME]}
+            for home in self._home_choices
+        ]
         data_schema = vol.Schema(
             {
                 vol.Required(CONF_HOME_ID): SelectSelector(
@@ -164,172 +186,124 @@ class HomePlusSecurityFlowHandler(ConfigFlow, domain=DOMAIN):
                 )
             }
         )
-        return self.async_show_form(step_id="select_home", data_schema=data_schema, errors=errors)
-
-    def _build_oauth_implementation(self, user_input: dict[str, Any]) -> LocalOAuth2Implementation:
-        """Build OAuth implementation for app stack."""
-        return LocalOAuth2Implementation(
-            hass=self.hass,
-            domain=DOMAIN,
-            client_id=str(user_input.get(CONF_CLIENT_ID, DEFAULT_CLIENT_ID)),
-            client_secret=str(user_input.get(CONF_CLIENT_SECRET, DEFAULT_CLIENT_SECRET)),
-            authorize_url=APP_AUTHORIZE_URL,
-            token_url=str(user_input.get(CONF_TOKEN_URL, DEFAULT_TOKEN_URL)),
+        return self.async_show_form(
+            step_id="select_home", data_schema=data_schema, errors=errors
         )
 
-    async def _async_fetch_supported_homes(self, user_input: dict[str, Any]) -> list[dict[str, str]]:
-        """Validate auth and return homes containing BNCX modules."""
+    async def _async_fetch_supported_homes(
+        self, entry_data: dict[str, Any]
+    ) -> list[dict[str, str]]:
+        """Return homes that expose a BNCX module."""
         session = async_get_clientsession(self.hass)
-
         auth_config = HomePlusSecurityAuthConfig(
-            token_url=str(user_input.get(CONF_TOKEN_URL, DEFAULT_TOKEN_URL)),
-            client_id=str(user_input.get(CONF_CLIENT_ID, DEFAULT_CLIENT_ID)),
-            client_secret=str(user_input.get(CONF_CLIENT_SECRET, DEFAULT_CLIENT_SECRET)),
-            app_version=str(user_input.get(CONF_APP_VERSION, DEFAULT_APP_VERSION)),
-            scope=str(user_input.get(CONF_SCOPE, DEFAULT_SCOPE)),
-            username=str(user_input.get(CONF_USERNAME, "")),
-            password=str(user_input.get(CONF_PASSWORD, "")),
+            token_url=str(entry_data.get(CONF_TOKEN_URL, DEFAULT_TOKEN_URL)),
+            client_id=str(entry_data.get(CONF_CLIENT_ID, DEFAULT_CLIENT_ID)),
+            client_secret=str(entry_data.get(CONF_CLIENT_SECRET, DEFAULT_CLIENT_SECRET)),
+            scope=str(entry_data.get(CONF_SCOPE, DEFAULT_SCOPE)),
         )
 
         client = HomePlusSecurityApiClient(
             session=session,
-            api_base_url=str(user_input.get(CONF_API_BASE_URL, DEFAULT_API_BASE_URL)),
+            api_base_url=str(entry_data.get(CONF_API_BASE_URL, DEFAULT_API_BASE_URL)),
             auth_config=auth_config,
-            access_token=str(user_input.get(CONF_ACCESS_TOKEN, "")),
-            refresh_token=str(user_input.get(CONF_REFRESH_TOKEN, "")),
+            access_token=str(entry_data.get(CONF_ACCESS_TOKEN, "")),
+            refresh_token=str(entry_data.get(CONF_REFRESH_TOKEN, "")),
         )
 
         homesdata = await client.async_get_homesdata()
         homes = extract_homes(homesdata)
 
-        choices: list[dict[str, str]] = []
+        bncx_choices: list[dict[str, str]] = []
         for home in homes:
             home_id = str(home.get("id", "")).strip()
             if not home_id:
                 continue
 
             home_name = str(home.get("name", home_id)).strip() or home_id
-            bncx = extract_home_bnc_module(home)
+            if extract_home_bncx_module(home):
+                bncx_choices.append({CONF_HOME_ID: home_id, CONF_HOME_NAME: home_name})
 
-            # Some token contexts may return homes without full module topology in homesdata.
-            # Fallback to homestatus lookup before excluding the home.
-            if not bncx:
-                try:
-                    homestatus = await client.async_get_homestatus(home_id)
-                except HomePlusSecurityApiError:
-                    homestatus = {}
-                bncx = extract_bncx_from_homestatus(homestatus)
-                if not bncx:
-                    continue
+        return bncx_choices
 
-            bncx_name = str(bncx.get("name", bncx.get("id", "BNCX"))).strip()
-            choices.append({CONF_HOME_ID: home_id, CONF_HOME_NAME: f"{home_name} ({bncx_name})"})
-
-        return choices
-
-    async def _async_create_entry_for_home(
+    async def _async_create_or_update_entry(
         self,
-        user_input: dict[str, Any],
+        entry_data: dict[str, Any],
         selected_home: dict[str, str],
     ) -> ConfigFlowResult:
-        """Create config entry after choosing a home."""
-        data = dict(user_input)
-        data[CONF_HOME_ID] = selected_home[CONF_HOME_ID]
-        data[CONF_HOME_NAME] = selected_home[CONF_HOME_NAME]
+        """Create config entry (or update existing on reauth)."""
+        selected_home_id = selected_home[CONF_HOME_ID]
+        selected_home_name = selected_home[CONF_HOME_NAME]
+        selected_unique_id = _entry_unique_id(selected_home_id)
 
-        await self.async_set_unique_id(DOMAIN)
+        data = dict(entry_data)
+        data[CONF_HOME_ID] = selected_home_id
+        data[CONF_HOME_NAME] = selected_home_name
+
+        if self._hps_reauth_entry_id:
+            reauth_entry = self.hass.config_entries.async_get_entry(self._hps_reauth_entry_id)
+            if reauth_entry is None:
+                return self.async_abort(reason="oauth_failed")
+
+            duplicate_entry = self._find_entry_by_home_id(selected_home_id)
+            if duplicate_entry and duplicate_entry.entry_id != reauth_entry.entry_id:
+                return self.async_abort(reason="already_configured_home")
+
+            merged = dict(reauth_entry.data)
+            merged.update(data)
+            self.hass.config_entries.async_update_entry(
+                reauth_entry,
+                data=merged,
+                title=f"{NAME} ({selected_home_name})",
+                unique_id=selected_unique_id,
+            )
+            await self.hass.config_entries.async_reload(reauth_entry.entry_id)
+            return self.async_abort(reason="reauth_successful")
+
+        if self._find_entry_by_home_id(selected_home_id):
+            return self.async_abort(reason="already_configured_home")
+
+        await self.async_set_unique_id(selected_unique_id)
         self._abort_if_unique_id_configured()
-        return self.async_create_entry(title=f"{NAME} ({selected_home[CONF_HOME_NAME]})", data=data)
 
-
-class HomePlusSecurityOptionsFlow(OptionsFlow):
-    """Handle Home + Security options."""
-
-    async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
-        """Manage options."""
-        if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
-
-        options = self.config_entry.options
-        data = self.config_entry.data
-
-        schema = vol.Schema(
-            {
-                vol.Required(
-                    CONF_APP_VERSION,
-                    default=options.get(CONF_APP_VERSION, data.get(CONF_APP_VERSION, DEFAULT_APP_VERSION)),
-                ): str,
-                vol.Required(
-                    CONF_APP_TYPE,
-                    default=options.get(CONF_APP_TYPE, data.get(CONF_APP_TYPE, DEFAULT_APP_TYPE)),
-                ): str,
-                vol.Required(
-                    CONF_SCOPE,
-                    default=options.get(CONF_SCOPE, data.get(CONF_SCOPE, DEFAULT_SCOPE)),
-                ): str,
-                vol.Required(
-                    CONF_TOKEN_URL,
-                    default=options.get(CONF_TOKEN_URL, data.get(CONF_TOKEN_URL, DEFAULT_TOKEN_URL)),
-                ): str,
-                vol.Required(
-                    CONF_API_BASE_URL,
-                    default=options.get(CONF_API_BASE_URL, data.get(CONF_API_BASE_URL, DEFAULT_API_BASE_URL)),
-                ): str,
-                vol.Required(
-                    CONF_WS_URL,
-                    default=options.get(CONF_WS_URL, data.get(CONF_WS_URL, DEFAULT_WS_URL)),
-                ): str,
-                vol.Required(
-                    CONF_TURN_URL,
-                    default=options.get(CONF_TURN_URL, data.get(CONF_TURN_URL, DEFAULT_TURN_URL)),
-                ): str,
-            }
+        return self.async_create_entry(
+            title=f"{NAME} ({selected_home_name})", data=data
         )
 
-        return self.async_show_form(step_id="init", data_schema=schema)
+    def _find_entry_by_home_id(self, home_id: str) -> ConfigEntry | None:
+        """Return an existing config entry that already targets the same home."""
+        for entry in self._async_current_entries():
+            if str(entry.data.get(CONF_HOME_ID, "")) == home_id:
+                return entry
+        return None
 
+    @callback
+    def _ensure_local_oauth_impl_registered(self) -> None:
+        """Register the local OAuth implementation once."""
+        if self.hass.data.get(_DATA_LOCAL_IMPL_REGISTERED):
+            return
 
-def _build_user_schema(defaults: dict[str, Any]) -> vol.Schema:
-    """Deprecated helper retained for backwards compatibility."""
-    return vol.Schema({})
+        implementation = HomePlusSecurityOAuth2Implementation(
+            hass=self.hass,
+            domain=_IMPL_KEY,
+            client_id=DEFAULT_CLIENT_ID,
+            client_secret=DEFAULT_CLIENT_SECRET,
+            authorize_url=APP_AUTHORIZE_URL,
+            token_url=DEFAULT_TOKEN_URL,
+        )
+        self.async_register_implementation(self.hass, implementation)
+        self.hass.data[_DATA_LOCAL_IMPL_REGISTERED] = True
 
-
-def _default_user_input() -> dict[str, Any]:
-    """Return internal defaults used for official-style setup UX."""
+def _default_entry_data() -> dict[str, Any]:
+    """Default entry values used by API client setup."""
     return {
         CONF_CLIENT_ID: DEFAULT_CLIENT_ID,
         CONF_CLIENT_SECRET: DEFAULT_CLIENT_SECRET,
-        CONF_APP_VERSION: DEFAULT_APP_VERSION,
-        CONF_APP_TYPE: DEFAULT_APP_TYPE,
         CONF_SCOPE: DEFAULT_SCOPE,
         CONF_TOKEN_URL: DEFAULT_TOKEN_URL,
         CONF_API_BASE_URL: DEFAULT_API_BASE_URL,
-        CONF_WS_URL: DEFAULT_WS_URL,
-        CONF_TURN_URL: DEFAULT_TURN_URL,
     }
 
 
-def extract_home_bnc_module(home: dict[str, Any]) -> dict[str, Any] | None:
-    """Return BNCX module from home metadata."""
-    return extract_home_bncx_module(home)
-
-
-def extract_bncx_from_homestatus(homestatus: dict[str, Any]) -> dict[str, Any] | None:
-    """Return BNCX module from homestatus payload."""
-    body = homestatus.get("body")
-    if not isinstance(body, dict):
-        return None
-
-    home = body.get("home")
-    if not isinstance(home, dict):
-        return None
-
-    modules = home.get("modules")
-    if not isinstance(modules, list):
-        return None
-
-    for module in modules:
-        if isinstance(module, dict) and module.get("type") == "BNCX":
-            return module
-
-    return None
+def _entry_unique_id(home_id: str) -> str:
+    """Return a stable unique id for one configured home."""
+    return f"{DOMAIN}_{home_id}"

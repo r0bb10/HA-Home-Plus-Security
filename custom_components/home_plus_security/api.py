@@ -10,10 +10,9 @@ from aiohttp import ClientError, ClientResponse
 from aiohttp.client import ClientSession
 
 from .const import (
-    CONF_APP_VERSION,
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
-    CONF_SCOPE,
+    REQUIRED_SECURITY_SCOPE,
     TOKEN_REFRESH_MARGIN,
 )
 
@@ -35,10 +34,7 @@ class HomePlusSecurityAuthConfig:
     token_url: str
     client_id: str
     client_secret: str
-    app_version: str
     scope: str
-    username: str
-    password: str
 
 
 class HomePlusSecurityApiClient:
@@ -61,6 +57,7 @@ class HomePlusSecurityApiClient:
         self._access_token = access_token
         self._refresh_token = refresh_token
         self._token_expires_at: datetime | None = None
+        self._token_scope: set[str] = normalize_scope(self._auth.scope)
 
     @property
     def refresh_token(self) -> str:
@@ -75,10 +72,6 @@ class HomePlusSecurityApiClient:
 
         if self._refresh_token:
             await self._async_refresh_token()
-            return
-
-        if self._auth.username and self._auth.password:
-            await self._async_password_login()
             return
 
         raise HomePlusSecurityAuthError("No valid authentication path configured.")
@@ -117,19 +110,6 @@ class HomePlusSecurityApiClient:
         except ClientError as err:
             raise HomePlusSecurityApiError(f"HTTP error while requesting {url}") from err
 
-    async def _async_password_login(self) -> None:
-        payload = {
-            "grant_type": "password",
-            CONF_CLIENT_ID: self._auth.client_id,
-            CONF_CLIENT_SECRET: self._auth.client_secret,
-            "username": self._auth.username,
-            "password": self._auth.password,
-            CONF_SCOPE: self._auth.scope,
-            CONF_APP_VERSION: self._auth.app_version,
-        }
-        token_payload = await self._async_post_token(payload)
-        await self._async_apply_token_payload(token_payload)
-
     async def _async_refresh_token(self) -> None:
         if not self._refresh_token:
             raise HomePlusSecurityAuthError("Refresh token is missing.")
@@ -161,6 +141,7 @@ class HomePlusSecurityApiClient:
         access_token = payload.get("access_token")
         refresh_token = payload.get("refresh_token")
         expires_in = payload.get("expires_in")
+        payload_scope = payload.get("scope")
 
         if not isinstance(access_token, str) or not access_token:
             raise HomePlusSecurityAuthError("Token payload missing access_token")
@@ -169,6 +150,16 @@ class HomePlusSecurityApiClient:
 
         self._access_token = access_token
         self._refresh_token = refresh_token
+
+        if payload_scope is not None:
+            self._token_scope = normalize_scope(payload_scope)
+
+        if REQUIRED_SECURITY_SCOPE not in self._token_scope:
+            scope_text = " ".join(sorted(self._token_scope)) if self._token_scope else "(missing)"
+            raise HomePlusSecurityAuthError(
+                f"Token scope is not valid for Home + Security. "
+                f"Expected '{REQUIRED_SECURITY_SCOPE}', got '{scope_text}'."
+            )
 
         expires_seconds = int(expires_in) if isinstance(expires_in, (int, str)) else 3600
         self._token_expires_at = datetime.now(timezone.utc) + timedelta(seconds=max(expires_seconds, 60))
@@ -219,3 +210,16 @@ def extract_home_bncx_module(home: dict[str, Any]) -> dict[str, Any] | None:
         if isinstance(module, dict) and module.get("type") == "BNCX":
             return module
     return None
+
+
+def normalize_scope(scope_value: Any) -> set[str]:
+    """Normalize scope value (string/list) to a set of scope tokens."""
+    if isinstance(scope_value, str):
+        return {token for token in scope_value.replace(",", " ").split() if token}
+    if isinstance(scope_value, list):
+        values: set[str] = set()
+        for item in scope_value:
+            if isinstance(item, str) and item.strip():
+                values.add(item.strip())
+        return values
+    return set()

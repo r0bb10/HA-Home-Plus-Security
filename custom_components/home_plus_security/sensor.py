@@ -13,6 +13,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DATA_COORDINATOR, DOMAIN
+from .device import build_device_info
 
 
 async def async_setup_entry(
@@ -40,7 +41,6 @@ class HomePlusSecurityBaseEntity(CoordinatorEntity):
 
     def __init__(self, coordinator, entry_id: str) -> None:
         super().__init__(coordinator)
-        self._entry_id = entry_id
 
     @property
     def _bncx_id(self) -> str | None:
@@ -48,6 +48,13 @@ class HomePlusSecurityBaseEntity(CoordinatorEntity):
         value = bncx_home.get("id")
         if isinstance(value, str) and value:
             return value
+        bncx_status = self.coordinator.data.get("bncx_status", {})
+        status_id = bncx_status.get("id")
+        if isinstance(status_id, str) and status_id:
+            return status_id
+        home_id = getattr(self.coordinator, "home_id", None)
+        if isinstance(home_id, str) and home_id:
+            return home_id
         return None
 
     @property
@@ -56,20 +63,11 @@ class HomePlusSecurityBaseEntity(CoordinatorEntity):
         if not bncx_id:
             return None
 
-        bncx_home = self.coordinator.data.get("bncx_home", {})
-        bncx_status = self.coordinator.data.get("bncx_status", {})
-
-        name = str(bncx_home.get("name", "Classe 300EOS"))
-        sw_version = bncx_status.get("firmware_name")
-        hw_version = bncx_status.get("hardware_version")
-
-        return DeviceInfo(
-            identifiers={(DOMAIN, bncx_id)},
-            manufacturer="BTicino / Netatmo",
-            model="Classe 300EOS (BNCX)",
-            name=name,
-            sw_version=str(sw_version) if sw_version is not None else None,
-            hw_version=str(hw_version) if hw_version is not None else None,
+        return build_device_info(
+            home=self.coordinator.data.get("home", {}),
+            bncx_home=self.coordinator.data.get("bncx_home", {}),
+            bncx_status=self.coordinator.data.get("bncx_status", {}),
+            fallback_id=bncx_id,
         )
 
 
@@ -113,17 +111,18 @@ class HomePlusSecurityUptimeSensor(HomePlusSecurityBaseEntity, SensorEntity):
 
     _attr_name = "Uptime"
     _attr_icon = "mdi:timer-outline"
-    _attr_native_unit_of_measurement = UnitOfTime.SECONDS
 
     def __init__(self, coordinator, entry_id: str) -> None:
         super().__init__(coordinator, entry_id)
         self._attr_unique_id = f"{entry_id}_bncx_uptime"
 
     @property
-    def native_value(self) -> int | None:
+    def native_value(self) -> str | None:
         value = self.coordinator.data.get("bncx_status", {}).get("uptime")
         if isinstance(value, int):
-            return value
+            hours = value // 3600
+            minutes = (value % 3600) // 60
+            return f"{hours}h {minutes}min"
         return None
 
 

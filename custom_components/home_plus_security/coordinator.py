@@ -51,15 +51,51 @@ class HomePlusSecurityDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]
             ),
             None,
         )
-        bncx_id = str(bncx_home.get("id")) if isinstance(bncx_home, dict) and bncx_home.get("id") else None
+        bncx_status_by_type = next(
+            (
+                module
+                for module in status_modules
+                if isinstance(module, dict) and module.get("type") == "BNCX"
+            ),
+            None,
+        )
+
+        bncx_id = (
+            str(bncx_home.get("id"))
+            if isinstance(bncx_home, dict) and bncx_home.get("id")
+            else (
+                str(bncx_status_by_type.get("id"))
+                if isinstance(bncx_status_by_type, dict) and bncx_status_by_type.get("id")
+                else None
+            )
+        )
         bncx_status = next(
             (
                 module
                 for module in status_modules
                 if isinstance(module, dict) and bncx_id and str(module.get("id")) == bncx_id
             ),
-            None,
+            bncx_status_by_type if isinstance(bncx_status_by_type, dict) else None,
         )
+
+        if not isinstance(bncx_home, dict):
+            bncx_home = {}
+
+        if isinstance(bncx_status, dict):
+            bncx_home = {
+                "id": bncx_home.get("id") or bncx_status.get("id"),
+                "name": bncx_home.get("name") or selected_home.get("name", "Classe 300EOS"),
+                "type": "BNCX",
+            }
+
+        # Keep a stable synthetic BNCX shell when topology/status is partial,
+        # so all entities can still bind to one HA device.
+        if not bncx_home.get("id"):
+            bncx_home = {
+                "id": self.home_id,
+                "name": selected_home.get("name", "Classe 300EOS"),
+                "type": "BNCX",
+            }
 
         return {
             "home": selected_home,

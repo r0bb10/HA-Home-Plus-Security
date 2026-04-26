@@ -11,34 +11,23 @@
         "data": {
           "home_id": "Home"
         }
+      },
+      "reauth_confirm": {
+        "title": "Reconnect Home + Security",
+        "description": "Your token scope is no longer valid for security data. Continue to re-authorize Home + Security access."
       }
     },
     "error": {
       "invalid_home": "The selected home is invalid. Please try again."
     },
     "abort": {
-      "single_instance_allowed": "Only a single Home + Security configuration is allowed.",
+      "already_configured_home": "This home is already configured in Home + Security.",
       "no_homes": "Home discovery state was lost. Restart setup.",
       "user_rejected_authorize": "Authorization was rejected in the portal.",
       "oauth_failed": "OAuth login failed.",
+      "wrong_scope": "The authorized token has the wrong scope. Authorize Home + Security security access, not weather/station access.",
       "cannot_connect": "Could not connect to Home + Security endpoints.",
       "no_bncx_homes": "No home with a Classe 300EOS (BNCX) module was found on this account."
-    }
-  },
-  "options": {
-    "step": {
-      "init": {
-        "title": "Home + Security options",
-        "data": {
-          "app_version": "App version",
-          "app_type": "App type",
-          "scope": "OAuth scope",
-          "token_url": "Token URL",
-          "api_base_url": "API base URL",
-          "ws_url": "Websocket URL",
-          "turn_url": "TURN URL"
-        }
-      }
     }
   }
 }
