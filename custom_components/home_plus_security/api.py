@@ -5,14 +5,23 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import time
 from typing import Any, Awaitable, Callable
 
-from aiohttp import ClientConnectionError, ClientConnectorDNSError, ClientError, ClientResponse, ServerTimeoutError
+from aiohttp import (
+    ClientConnectionError,
+    ClientConnectorDNSError,
+    ClientError,
+    ClientResponse,
+    ServerTimeoutError,
+)
 from aiohttp.client import ClientSession
 
 from .const import (
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
+    DEFAULT_APP_CAMERA_TYPE,
+    DEFAULT_APP_VERSION,
     REQUIRED_SECURITY_SCOPE,
     TOKEN_REFRESH_MARGIN,
 )
@@ -22,6 +31,23 @@ TokenUpdateCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 API_RETRY_ATTEMPTS = 3
 API_RETRY_BASE_DELAY_SECONDS = 0.75
 AUTH_RETRY_STATUSES = {401, 403}
+
+DEFAULT_DEVICE_TYPES: tuple[str, ...] = (
+    "BNMH",
+    "BNCX",
+    "BFII",
+    "BPAC",
+    "BPVC",
+    "BNC1",
+    "BDIY",
+    "BNHY",
+    "NACamera",
+    "NOC",
+    "NDB",
+    "NSD",
+    "NCO",
+    "NDL",
+)
 
 
 class HomePlusSecurityApiError(Exception):
@@ -48,14 +74,18 @@ class HomePlusSecurityApiClient:
     def __init__(
         self,
         session: ClientSession,
-        api_base_url: str,
+        app_api_base_url: str,
+        sync_api_base_url: str,
+        turn_api_base_url: str,
         auth_config: HomePlusSecurityAuthConfig,
         access_token: str,
         refresh_token: str,
         token_update_cb: TokenUpdateCallback | None = None,
     ) -> None:
         self._session = session
-        self._api_base_url = api_base_url.rstrip("/")
+        self._app_api_base_url = app_api_base_url.rstrip("/")
+        self._sync_api_base_url = sync_api_base_url.rstrip("/")
+        self._turn_api_base_url = turn_api_base_url.rstrip("/")
         self._auth = auth_config
         self._token_update_cb = token_update_cb
 
@@ -68,6 +98,16 @@ class HomePlusSecurityApiClient:
     def refresh_token(self) -> str:
         """Current refresh token."""
         return self._refresh_token
+
+    @property
+    def access_token(self) -> str:
+        """Current access token."""
+        return self._access_token
+
+    async def async_get_access_token(self) -> str:
+        """Return a valid access token."""
+        await self.async_ensure_token()
+        return self._access_token
 
     async def async_ensure_token(self) -> None:
         """Ensure a usable access token is available."""
@@ -83,11 +123,43 @@ class HomePlusSecurityApiClient:
 
     async def async_get_homesdata(self) -> dict[str, Any]:
         """Fetch homesdata from app API."""
-        return await self.async_get_json("homesdata")
+        payload = {
+            "app_type": DEFAULT_APP_CAMERA_TYPE,
+            "app_version": DEFAULT_APP_VERSION,
+            "device_types": list(DEFAULT_DEVICE_TYPES),
+            "sync_measurements": False,
+        }
+        return await self._async_post_app_json("homesdata", payload)
 
     async def async_get_homestatus(self, home_id: str) -> dict[str, Any]:
-        """Fetch homestatus from app API."""
-        return await self.async_get_json(f"homestatus?home_id={home_id}")
+        """Fetch homestatus from sync API."""
+        payload = {
+            "app_type": DEFAULT_APP_CAMERA_TYPE,
+            "app_version": DEFAULT_APP_VERSION,
+            "home_id": home_id,
+            "device_types": list(DEFAULT_DEVICE_TYPES),
+        }
+        return await self._async_post_sync_json("homestatus", payload)
+
+    async def async_get_events(self, home_id: str, size: int = 20) -> dict[str, Any]:
+        """Fetch recent events for the selected home."""
+        payload = {
+            "app_type": DEFAULT_APP_CAMERA_TYPE,
+            "app_version": DEFAULT_APP_VERSION,
+            "home_id": home_id,
+            "size": size,
+        }
+        return await self._async_post_app_json("getevents", payload)
+
+    async def async_get_turn_credentials(self) -> dict[str, Any]:
+        """Fetch TURN credentials used by the app WebRTC stack."""
+        payload = {"client_type": "user"}
+        return await self._async_post_json(self._turn_api_base_url, "getcredentials", payload)
+
+    async def async_add_push_context(self, *, home_id: str, device_id: str) -> dict[str, Any]:
+        """Bind push context for a home/device pair."""
+        payload = {"home_id": home_id, "device_id": device_id}
+        return await self._async_post_app_json("addpushcontext", payload)
 
     async def async_unlock_module(
         self,
@@ -95,11 +167,9 @@ class HomePlusSecurityApiClient:
         home_id: str,
         module_id: str,
         bridge_id: str | None = None,
+        timezone_name: str | None = None,
     ) -> dict[str, Any]:
         """Trigger unlock by setting lock=false on a module patch."""
-        # App-faithful payload from reverse engineering:
-        # setstate -> home.modules[].lock = false (top-level module field),
-        # with optional bridge when present on module metadata.
         module: dict[str, Any] = {
             "id": module_id,
             "lock": False,
@@ -107,18 +177,57 @@ class HomePlusSecurityApiClient:
         if bridge_id:
             module["bridge"] = bridge_id
 
-        payload = {
-            "home": {
-                "id": home_id,
-                "modules": [module],
-            }
+        home_payload: dict[str, Any] = {
+            "id": home_id,
+            "modules": [module],
         }
-        return await self.async_post_json("setstate", payload)
+        if timezone_name:
+            home_payload["timezone"] = timezone_name
 
-    async def async_get_json(self, endpoint: str) -> dict[str, Any]:
-        """GET app API endpoint with bearer auth and one refresh retry."""
+        return await self.async_post_setstate({"home": home_payload})
+
+    async def async_post_setstate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Post a raw setstate payload to sync API."""
+        return await self._async_post_sync_json("setstate", payload)
+
+    async def async_post_rtc_action(
+        self,
+        *,
+        action_type: str,
+        data: dict[str, Any],
+        session_id: str | None = None,
+        tag_id: str | None = None,
+        device_id: str | None = None,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Post an RTC action through sync setstate (app-faithful transport)."""
+        payload: dict[str, Any] = {
+            "action": "rtc",
+            "data": {"type": action_type, **data},
+        }
+        if session_id:
+            payload["session_id"] = session_id
+        if tag_id:
+            payload["tag_id"] = tag_id
+        if device_id:
+            payload["device_id"] = device_id
+        if correlation_id:
+            payload["correlation_id"] = correlation_id
+        else:
+            payload["correlation_id"] = str(int(time.time() * 1000))
+
+        return await self.async_post_setstate(payload)
+
+    async def _async_post_app_json(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._async_post_json(self._app_api_base_url, endpoint, payload)
+
+    async def _async_post_sync_json(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._async_post_json(self._sync_api_base_url, endpoint, payload)
+
+    async def _async_post_json(self, base_url: str, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """POST endpoint with bearer auth and one refresh retry."""
         await self.async_ensure_token()
-        response = await self._async_api_get(endpoint)
+        response = await self._async_api_post(base_url, endpoint, payload)
 
         if response.status not in AUTH_RETRY_STATUSES:
             return await self._async_handle_json_response(response)
@@ -126,42 +235,11 @@ class HomePlusSecurityApiClient:
         response.release()
         await self._async_refresh_token()
 
-        response = await self._async_api_get(endpoint)
+        response = await self._async_api_post(base_url, endpoint, payload)
         return await self._async_handle_json_response(response)
 
-    async def async_post_json(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """POST app API endpoint with bearer auth and one refresh retry."""
-        await self.async_ensure_token()
-        response = await self._async_api_post(endpoint, payload)
-
-        if response.status not in AUTH_RETRY_STATUSES:
-            return await self._async_handle_json_response(response)
-
-        response.release()
-        await self._async_refresh_token()
-
-        response = await self._async_api_post(endpoint, payload)
-        return await self._async_handle_json_response(response)
-
-    async def _async_api_get(self, endpoint: str) -> ClientResponse:
-        url = f"{self._api_base_url}/{endpoint.lstrip('/')}"
-        headers = {
-            "Authorization": f"Bearer {self._access_token}",
-            "User-Agent": "okhttp/4.12.0",
-        }
-
-        for attempt in range(1, API_RETRY_ATTEMPTS + 1):
-            try:
-                return await self._session.get(url, headers=headers)
-            except (ClientConnectorDNSError, ClientConnectionError, ServerTimeoutError, asyncio.TimeoutError, OSError) as err:
-                if attempt >= API_RETRY_ATTEMPTS:
-                    raise HomePlusSecurityApiError(f"Transient network error while requesting {url}") from err
-                await asyncio.sleep(API_RETRY_BASE_DELAY_SECONDS * attempt)
-            except ClientError as err:
-                raise HomePlusSecurityApiError(f"HTTP error while requesting {url}") from err
-
-    async def _async_api_post(self, endpoint: str, payload: dict[str, Any]) -> ClientResponse:
-        url = f"{self._api_base_url}/{endpoint.lstrip('/')}"
+    async def _async_api_post(self, base_url: str, endpoint: str, payload: dict[str, Any]) -> ClientResponse:
+        url = f"{base_url}/{endpoint.lstrip('/')}"
         headers = {
             "Authorization": f"Bearer {self._access_token}",
             "User-Agent": "okhttp/4.12.0",
@@ -171,7 +249,13 @@ class HomePlusSecurityApiClient:
         for attempt in range(1, API_RETRY_ATTEMPTS + 1):
             try:
                 return await self._session.post(url, json=payload, headers=headers)
-            except (ClientConnectorDNSError, ClientConnectionError, ServerTimeoutError, asyncio.TimeoutError, OSError) as err:
+            except (
+                ClientConnectorDNSError,
+                ClientConnectionError,
+                ServerTimeoutError,
+                asyncio.TimeoutError,
+                OSError,
+            ) as err:
                 if attempt >= API_RETRY_ATTEMPTS:
                     raise HomePlusSecurityApiError(f"Transient network error while requesting {url}") from err
                 await asyncio.sleep(API_RETRY_BASE_DELAY_SECONDS * attempt)
@@ -202,8 +286,7 @@ class HomePlusSecurityApiClient:
         except ClientError as err:
             raise HomePlusSecurityApiError("Token endpoint request failed") from err
 
-        body = await self._async_handle_json_response(response, auth=True)
-        return body
+        return await self._async_handle_json_response(response, auth=True)
 
     async def _async_apply_token_payload(self, payload: dict[str, Any]) -> None:
         access_token = payload.get("access_token")
@@ -250,7 +333,7 @@ class HomePlusSecurityApiClient:
         response.release()
 
         message = body.get("error") or body.get("message") or body
-        if auth or response.status in (401, 403):
+        if auth or response.status in AUTH_RETRY_STATUSES:
             raise HomePlusSecurityAuthError(f"Auth failed ({response.status}): {message}")
         raise HomePlusSecurityApiError(f"Request failed ({response.status}): {message}")
 

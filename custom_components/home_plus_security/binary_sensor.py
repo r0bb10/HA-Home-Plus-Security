@@ -28,6 +28,7 @@ async def async_setup_entry(
         [
             HomePlusSecurityWebsocketConnectedBinarySensor(coordinator, entry.entry_id),
             HomePlusSecurityCloudWebSocketBinarySensor(coordinator, entry.entry_id),
+            HomePlusSecurityCloudWebSocketStaleBinarySensor(coordinator, entry.entry_id),
         ]
     )
 
@@ -108,9 +109,52 @@ class HomePlusSecurityCloudWebSocketBinarySensor(CoordinatorEntity, BinarySensor
 
     @property
     def is_on(self) -> bool | None:
+        runtime_connected = getattr(self.coordinator, "ws_connected", None)
+        if isinstance(runtime_connected, bool):
+            return runtime_connected
+
         status = self.coordinator.data.get("bncx_status", {})
         websocket_connected = status.get("websocket_connected")
         if isinstance(websocket_connected, bool):
             return websocket_connected
 
+        return None
+
+
+class HomePlusSecurityCloudWebSocketStaleBinarySensor(CoordinatorEntity, BinarySensorEntity):
+    """Cloud websocket stale state."""
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_name = "WebSocket Stale"
+    _attr_icon = "mdi:web-clock"
+
+    def __init__(self, coordinator, entry_id: str) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry_id}_bncx_websocket_stale"
+
+    @property
+    def device_info(self) -> DeviceInfo | None:
+        bncx_home = self.coordinator.data.get("bncx_home", {})
+        bncx_status = self.coordinator.data.get("bncx_status", {})
+        bncx_id = bncx_home.get("id")
+        if not isinstance(bncx_id, str) or not bncx_id:
+            bncx_id = bncx_status.get("id")
+        if not isinstance(bncx_id, str) or not bncx_id:
+            bncx_id = getattr(self.coordinator, "home_id", None)
+        if not isinstance(bncx_id, str) or not bncx_id:
+            return None
+
+        return build_device_info(
+            home=self.coordinator.data.get("home", {}),
+            bncx_home=bncx_home,
+            bncx_status=bncx_status,
+            fallback_id=bncx_id,
+        )
+
+    @property
+    def is_on(self) -> bool | None:
+        ws_stale = getattr(self.coordinator, "ws_stale", None)
+        if isinstance(ws_stale, bool):
+            return ws_stale
         return None

@@ -82,11 +82,22 @@ class HomePlusSecurityUnlockButton(CoordinatorEntity, ButtonEntity):
             if not isinstance(bridge_id, str):
                 bridge_id = None
 
-        await self._client.async_unlock_module(
-            home_id=home_id,
-            module_id=module_id,
-            bridge_id=bridge_id,
-        )
+        async def _run_unlock() -> None:
+            await self._client.async_unlock_module(
+                home_id=home_id,
+                module_id=module_id,
+                bridge_id=bridge_id,
+                timezone_name=getattr(self.hass.config, "time_zone", None),
+            )
+
+        try:
+            await self.coordinator.async_run_guarded_command(
+                label="Unlock",
+                command_coro_factory=_run_unlock,
+            )
+        except Exception as err:  # noqa: BLE001 - show friendly message in HA UI
+            raise HomeAssistantError(str(err)) from err
+
         await self.coordinator.async_request_refresh()
 
     def _find_unlock_module(self) -> dict | None:

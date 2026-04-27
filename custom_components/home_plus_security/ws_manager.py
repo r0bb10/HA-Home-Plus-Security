@@ -1,0 +1,183 @@
+"""Push websocket manager for Home + Security."""
+
+from __future__ import annotations
+
+import asyncio
+from contextlib import suppress
+import json
+import logging
+import ssl
+import time
+from typing import Any
+
+from aiohttp import (
+    ClientError,
+    ClientSession,
+    ClientWebSocketResponse,
+    WSMsgType,
+)
+
+from .api import HomePlusSecurityApiClient
+from .const import (
+    DEFAULT_APP_VERSION,
+    PUSH_WS_URL,
+    WS_BOOT_RETRY_DELAYS,
+    WS_RESUBSCRIBE_INTERVAL_SECONDS,
+    WS_RUNTIME_RETRY_DELAYS,
+    WS_STALE_THRESHOLD_SECONDS,
+)
+from .coordinator import HomePlusSecurityDataUpdateCoordinator
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class HomePlusSecurityWsManager:
+    """Manage push websocket connect/reconnect/subscription lifecycle."""
+
+    def __init__(
+        self,
+        *,
+        session: ClientSession,
+        client: HomePlusSecurityApiClient,
+        coordinator: HomePlusSecurityDataUpdateCoordinator,
+    ) -> None:
+        self._session = session
+        self._client = client
+        self._coordinator = coordinator
+        self._task: asyncio.Task[None] | None = None
+        self._running = False
+        self._ws: ClientWebSocketResponse | None = None
+        self._ws_last_message_monotonic = 0.0
+
+    async def async_start(self) -> None:
+        """Start background connection manager."""
+        if self._task and not self._task.done():
+            return
+        self._running = True
+        self._task = asyncio.create_task(self._async_run_loop(), name="home_plus_security_ws_manager")
+
+    async def async_stop(self) -> None:
+        """Stop background manager and close websocket."""
+        self._running = False
+        if self._task and not self._task.done():
+            self._task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._task
+        self._task = None
+        await self._async_disconnect()
+
+    async def _async_run_loop(self) -> None:
+        boot_phase = True
+        retry_index = 0
+        while self._running:
+            try:
+                await self._async_connect_and_listen()
+                retry_index = 0
+                boot_phase = False
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # noqa: BLE001 - keep reconnecting until stop
+                _LOGGER.debug("Push websocket manager loop error: %s", err)
+            finally:
+                await self._async_disconnect()
+
+            if not self._running:
+                break
+
+            delays = WS_BOOT_RETRY_DELAYS if boot_phase else WS_RUNTIME_RETRY_DELAYS
+            delay = delays[min(retry_index, len(delays) - 1)]
+            retry_index += 1
+            await asyncio.sleep(delay)
+
+    async def _async_connect_and_listen(self) -> None:
+        """Open websocket, subscribe, then keep listener loop alive."""
+        ssl_context = ssl.create_default_context()
+        self._ws = await self._session.ws_connect(
+            PUSH_WS_URL,
+            ssl=ssl_context,
+            heartbeat=None,
+            autoping=True,
+        )
+
+        await self._async_subscribe()
+        self._coordinator.mark_ws_connected()
+        self._coordinator.note_ws_message()
+        self._ws_last_message_monotonic = time.monotonic()
+
+        last_resubscribe = time.monotonic()
+        while self._running and self._ws and not self._ws.closed:
+            try:
+                msg = await self._ws.receive(timeout=60)
+            except TimeoutError:
+                now = time.monotonic()
+                silence = now - self._ws_last_message_monotonic
+                if silence > WS_STALE_THRESHOLD_SECONDS:
+                    raise HomePlusSecurityWsError(f"Push websocket stale for {int(silence)}s")
+                if now - last_resubscribe >= WS_RESUBSCRIBE_INTERVAL_SECONDS:
+                    await self._async_subscribe()
+                    last_resubscribe = now
+                continue
+
+            if msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.CLOSING):
+                raise HomePlusSecurityWsError("Push websocket closed by remote.")
+            if msg.type == WSMsgType.ERROR:
+                raise HomePlusSecurityWsError(f"Push websocket error: {self._ws.exception()}")
+            if msg.type == WSMsgType.PING:
+                continue
+            if msg.type == WSMsgType.PONG:
+                continue
+            if msg.type != WSMsgType.TEXT:
+                continue
+
+            self._ws_last_message_monotonic = time.monotonic()
+            self._coordinator.note_ws_message()
+
+            try:
+                payload = msg.json()
+            except ValueError:
+                _LOGGER.debug("Push ws non-JSON message: %s", msg.data)
+                continue
+            await self._handle_message(payload)
+
+    async def _async_subscribe(self) -> None:
+        if not self._ws:
+            raise HomePlusSecurityWsError("Websocket is not connected.")
+        access_token = await self._client.async_get_access_token()
+        subscribe_payload = {
+            "action": "Subscribe",
+            "access_token": access_token,
+            "app_type": "app_camera",
+            "platform": "Android",
+            "version": DEFAULT_APP_VERSION,
+        }
+        await self._ws.send_json(subscribe_payload)
+        ack = await self._ws.receive(timeout=30)
+        if ack.type != WSMsgType.TEXT:
+            raise HomePlusSecurityWsError("Push subscribe failed: no text response.")
+        try:
+            payload = json.loads(ack.data)
+        except (TypeError, json.JSONDecodeError) as err:
+            raise HomePlusSecurityWsError("Push subscribe failed: invalid JSON response.") from err
+        if not isinstance(payload, dict) or payload.get("status") != "ok":
+            raise HomePlusSecurityWsError(f"Push subscribe rejected: {payload}")
+
+    async def _handle_message(self, payload: Any) -> None:
+        """Process push message.
+
+        We keep this lightweight for now and rely on coordinator polling for state.
+        """
+        if not isinstance(payload, dict):
+            return
+        _LOGGER.debug("Push ws message: %s", payload)
+
+    async def _async_disconnect(self) -> None:
+        ws = self._ws
+        self._ws = None
+        self._coordinator.mark_ws_disconnected()
+        if ws and not ws.closed:
+            with suppress(ClientError):
+                await ws.close()
+
+
+class HomePlusSecurityWsError(Exception):
+    """Raised for websocket manager errors."""

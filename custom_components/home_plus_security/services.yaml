@@ -1,0 +1,47 @@
+rtc_offer:
+  name: Start RTC Offer
+  description: Send an RTC offer on the signaling websocket.
+  fields:
+    entry_id:
+      name: Config Entry ID
+      description: Optional config entry id when multiple entries are loaded.
+      example: abcdef123456
+      selector:
+        text:
+    sdp:
+      name: SDP Offer
+      description: SDP offer payload.
+      required: true
+      selector:
+        text:
+          multiline: true
+    device_id:
+      name: Device ID
+      description: Optional explicit device id (defaults to selected BNCX id).
+      selector:
+        text:
+    module_id:
+      name: Module ID
+      description: Optional module id to target in the offer.
+      selector:
+        text:
+
+rtc_next_module:
+  name: RTC Next Module
+  description: Send the in-call next_module action for the active RTC session.
+  fields:
+    entry_id:
+      name: Config Entry ID
+      description: Optional config entry id when multiple entries are loaded.
+      selector:
+        text:
+
+rtc_terminate:
+  name: RTC Terminate
+  description: Send terminate for the active RTC session.
+  fields:
+    entry_id:
+      name: Config Entry ID
+      description: Optional config entry id when multiple entries are loaded.
+      selector:
+        text:

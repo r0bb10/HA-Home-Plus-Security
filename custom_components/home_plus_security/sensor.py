@@ -6,7 +6,7 @@ from typing import Any
 
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EntityCategory, UnitOfTime
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -29,6 +29,8 @@ async def async_setup_entry(
             HomePlusSecurityWifiStrengthSensor(coordinator, entry.entry_id),
             HomePlusSecurityUptimeSensor(coordinator, entry.entry_id),
             HomePlusSecurityLocalIpSensor(coordinator, entry.entry_id),
+            HomePlusSecurityWebSocketLastMessageSensor(coordinator, entry.entry_id),
+            HomePlusSecurityLastCommandErrorSensor(coordinator, entry.entry_id),
         ]
     )
 
@@ -139,4 +141,38 @@ class HomePlusSecurityLocalIpSensor(HomePlusSecurityBaseEntity, SensorEntity):
     @property
     def native_value(self) -> str | None:
         value = self.coordinator.data.get("bncx_status", {}).get("local_ipv4")
+        return str(value) if value is not None else None
+
+
+class HomePlusSecurityWebSocketLastMessageSensor(HomePlusSecurityBaseEntity, SensorEntity):
+    """Last websocket message timestamp."""
+
+    _attr_name = "WebSocket Last Message"
+    _attr_icon = "mdi:web-clock"
+
+    def __init__(self, coordinator, entry_id: str) -> None:
+        super().__init__(coordinator, entry_id)
+        self._attr_unique_id = f"{entry_id}_bncx_ws_last_message"
+
+    @property
+    def native_value(self) -> str | None:
+        ws_data = self.coordinator.data.get("ws", {})
+        value = ws_data.get("last_message_at") if isinstance(ws_data, dict) else None
+        return str(value) if value is not None else None
+
+
+class HomePlusSecurityLastCommandErrorSensor(HomePlusSecurityBaseEntity, SensorEntity):
+    """Latest command failure message."""
+
+    _attr_name = "Last Command Error"
+    _attr_icon = "mdi:alert-circle-outline"
+
+    def __init__(self, coordinator, entry_id: str) -> None:
+        super().__init__(coordinator, entry_id)
+        self._attr_unique_id = f"{entry_id}_bncx_last_command_error"
+
+    @property
+    def native_value(self) -> str | None:
+        ws_data = self.coordinator.data.get("ws", {})
+        value = ws_data.get("last_command_error") if isinstance(ws_data, dict) else None
         return str(value) if value is not None else None

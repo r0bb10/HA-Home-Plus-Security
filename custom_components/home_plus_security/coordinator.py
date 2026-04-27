@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
+from datetime import UTC, datetime
 import logging
-from typing import Any
+import time
+from typing import Any, Awaitable, Callable, TypeVar
 
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .api import HomePlusSecurityApiClient
-from .const import COORDINATOR_UPDATE_INTERVAL, DOMAIN
+from .api import HomePlusSecurityApiClient, HomePlusSecurityApiError
+from .const import (
+    COMMAND_COOLDOWN_SECONDS,
+    COMMAND_TIMEOUT_SECONDS,
+    COORDINATOR_UPDATE_INTERVAL,
+    DOMAIN,
+    WS_STALE_THRESHOLD_SECONDS,
+)
 
 _LOGGER = logging.getLogger(__name__)
+_T = TypeVar("_T")
 
 
 class HomePlusSecurityDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -26,10 +36,99 @@ class HomePlusSecurityDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]
         self.client = client
         self.home_id = home_id
 
+        self._command_lock = asyncio.Lock()
+        self._last_command_at_monotonic = 0.0
+        self._last_command_error: str | None = None
+
+        self._ws_connected = False
+        self._ws_last_message_at: datetime | None = None
+        self._ws_stale = False
+
+    @property
+    def last_command_error(self) -> str | None:
+        """Last command failure message."""
+        return self._last_command_error
+
+    @property
+    def ws_connected(self) -> bool:
+        """Current websocket manager connectivity state."""
+        return self._ws_connected
+
+    @property
+    def ws_stale(self) -> bool:
+        """True when websocket appears silent/stale."""
+        return self._ws_stale
+
+    def mark_ws_connected(self) -> None:
+        """Mark websocket as connected."""
+        self._ws_connected = True
+        self._ws_stale = False
+        self._publish_runtime_state()
+
+    def mark_ws_disconnected(self) -> None:
+        """Mark websocket as disconnected."""
+        self._ws_connected = False
+        self._publish_runtime_state()
+
+    def note_ws_message(self) -> None:
+        """Update websocket activity heartbeat."""
+        self._ws_last_message_at = datetime.now(UTC)
+        self._ws_stale = False
+        self._publish_runtime_state()
+
+    async def async_run_guarded_command(
+        self,
+        *,
+        label: str,
+        command_coro_factory: Callable[[], Awaitable[_T]],
+        timeout_seconds: float = COMMAND_TIMEOUT_SECONDS,
+        cooldown_seconds: float = COMMAND_COOLDOWN_SECONDS,
+    ) -> _T:
+        """Run one command at a time with cooldown and timeout guardrails."""
+        async with self._command_lock:
+            now = time.monotonic()
+            elapsed = now - self._last_command_at_monotonic
+            if elapsed < cooldown_seconds:
+                wait_left = cooldown_seconds - elapsed
+                raise HomePlusSecurityApiError(
+                    f"{label} blocked by cooldown ({wait_left:.1f}s remaining)."
+                )
+
+            self._last_command_error = None
+
+            try:
+                async with asyncio.timeout(timeout_seconds):
+                    result = await command_coro_factory()
+            except TimeoutError as err:
+                self._last_command_error = f"{label} timed out after {timeout_seconds:.1f}s."
+                self._publish_runtime_state()
+                raise HomePlusSecurityApiError(self._last_command_error) from err
+            except Exception as err:  # noqa: BLE001 - bubble up detailed backend error
+                self._last_command_error = f"{label} failed: {err}"
+                self._publish_runtime_state()
+                raise
+
+            self._last_command_at_monotonic = time.monotonic()
+            self._last_command_error = None
+            self._publish_runtime_state()
+            return result
+
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from the API."""
-        homesdata = await self.client.async_get_homesdata()
-        homestatus = await self.client.async_get_homestatus(self.home_id)
+        try:
+            homesdata = await self.client.async_get_homesdata()
+            homestatus = await self.client.async_get_homestatus(self.home_id)
+        except Exception as err:  # noqa: BLE001 - preserve last-good payload on transient failure
+            if isinstance(self.data, dict) and self.data:
+                _LOGGER.debug("Transient update failure, keeping last coordinator data: %s", err)
+                return self.data
+            raise
+
+        events_payload: dict[str, Any] = {}
+        try:
+            events_payload = await self.client.async_get_events(self.home_id, size=20)
+        except Exception as err:  # noqa: BLE001 - events are optional; keep core entities live
+            _LOGGER.debug("Events fetch failed during update: %s", err)
 
         homes = homesdata.get("body", {}).get("homes", [])
         selected_home = next(
@@ -88,8 +187,6 @@ class HomePlusSecurityDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]
                 "type": "BNCX",
             }
 
-        # Keep a stable synthetic BNCX shell when topology/status is partial,
-        # so all entities can still bind to one HA device.
         if not bncx_home.get("id"):
             bncx_home = {
                 "id": self.home_id,
@@ -97,9 +194,39 @@ class HomePlusSecurityDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]
                 "type": "BNCX",
             }
 
+        if self._ws_last_message_at:
+            silence_seconds = (datetime.now(UTC) - self._ws_last_message_at).total_seconds()
+            if silence_seconds > WS_STALE_THRESHOLD_SECONDS:
+                self._ws_stale = True
+
+        events = (
+            events_payload.get("body", {})
+            .get("home", {})
+            .get("events", [])
+        )
+        if not isinstance(events, list):
+            events = []
+
         return {
             "home": selected_home,
             "status_home": status_home if isinstance(status_home, dict) else {},
             "bncx_home": bncx_home if isinstance(bncx_home, dict) else {},
             "bncx_status": bncx_status if isinstance(bncx_status, dict) else {},
+            "events": events,
+            "ws": self._build_ws_state(),
         }
+
+    def _build_ws_state(self) -> dict[str, Any]:
+        return {
+            "connected": self._ws_connected,
+            "stale": self._ws_stale,
+            "last_message_at": self._ws_last_message_at.isoformat() if self._ws_last_message_at else None,
+            "last_command_error": self._last_command_error,
+        }
+
+    def _publish_runtime_state(self) -> None:
+        if not isinstance(self.data, dict) or not self.data:
+            return
+        new_data = dict(self.data)
+        new_data["ws"] = self._build_ws_state()
+        self.async_set_updated_data(new_data)

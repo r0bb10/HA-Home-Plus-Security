@@ -31,19 +31,24 @@ from .api import (
 from .const import (
     CONF_ACCESS_TOKEN,
     CONF_API_BASE_URL,
+    CONF_APP_API_BASE_URL,
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
     CONF_HOME_ID,
     CONF_HOME_NAME,
     CONF_REFRESH_TOKEN,
     CONF_SCOPE,
+    CONF_SYNC_API_BASE_URL,
     CONF_TOKEN_URL,
-    DEFAULT_API_BASE_URL,
+    CONF_TURN_API_BASE_URL,
+    DEFAULT_APP_API_BASE_URL,
     DEFAULT_APP_TYPE,
     DEFAULT_CLIENT_ID,
     DEFAULT_CLIENT_SECRET,
     DEFAULT_SCOPE,
+    DEFAULT_SYNC_API_BASE_URL,
     DEFAULT_TOKEN_URL,
+    DEFAULT_TURN_API_BASE_URL,
     DOMAIN,
     NAME,
     REQUIRED_SECURITY_SCOPE,
@@ -204,7 +209,14 @@ class HomePlusSecurityFlowHandler(
 
         client = HomePlusSecurityApiClient(
             session=session,
-            api_base_url=str(entry_data.get(CONF_API_BASE_URL, DEFAULT_API_BASE_URL)),
+            app_api_base_url=str(
+                entry_data.get(
+                    CONF_APP_API_BASE_URL,
+                    entry_data.get(CONF_API_BASE_URL, DEFAULT_APP_API_BASE_URL),
+                )
+            ),
+            sync_api_base_url=str(entry_data.get(CONF_SYNC_API_BASE_URL, DEFAULT_SYNC_API_BASE_URL)),
+            turn_api_base_url=str(entry_data.get(CONF_TURN_API_BASE_URL, DEFAULT_TURN_API_BASE_URL)),
             auth_config=auth_config,
             access_token=str(entry_data.get(CONF_ACCESS_TOKEN, "")),
             refresh_token=str(entry_data.get(CONF_REFRESH_TOKEN, "")),
@@ -300,7 +312,9 @@ def _default_entry_data() -> dict[str, Any]:
         CONF_CLIENT_SECRET: DEFAULT_CLIENT_SECRET,
         CONF_SCOPE: DEFAULT_SCOPE,
         CONF_TOKEN_URL: DEFAULT_TOKEN_URL,
-        CONF_API_BASE_URL: DEFAULT_API_BASE_URL,
+        CONF_APP_API_BASE_URL: DEFAULT_APP_API_BASE_URL,
+        CONF_SYNC_API_BASE_URL: DEFAULT_SYNC_API_BASE_URL,
+        CONF_TURN_API_BASE_URL: DEFAULT_TURN_API_BASE_URL,
     }
 
 
