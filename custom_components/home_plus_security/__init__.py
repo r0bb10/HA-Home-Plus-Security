@@ -19,7 +19,6 @@ from .api import (
 )
 from .const import (
     CONF_ACCESS_TOKEN,
-    CONF_API_BASE_URL,
     CONF_APP_API_BASE_URL,
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
@@ -96,7 +95,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HomePlusSecurityConfigEn
     app_api_base_url = _entry_value(
         entry,
         CONF_APP_API_BASE_URL,
-        _entry_value(entry, CONF_API_BASE_URL, DEFAULT_APP_API_BASE_URL),
+        DEFAULT_APP_API_BASE_URL,
     )
 
     client = HomePlusSecurityApiClient(
@@ -146,21 +145,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: HomePlusSecurityConfigEn
         bncx_status=bncx_status if isinstance(bncx_status, dict) else {},
         fallback_id=fallback_id,
     )
-    device_entry = device_registry.async_get_or_create(
+    device_registry.async_get_or_create(
         config_entry_id=entry.entry_id,
         **device_info,
-    )
-    # Normalize legacy fields from previous versions (model_id/suggested_area).
-    device_registry.async_update_device(
-        device_id=device_entry.id,
-        area_id=None,
-        manufacturer=device_info.get("manufacturer"),
-        model=device_info.get("model"),
-        model_id=None,
-        name=device_info.get("name"),
-        serial_number=device_info.get("serial_number"),
-        sw_version=device_info.get("sw_version"),
-        hw_version=device_info.get("hw_version"),
     )
 
     hass.data[DOMAIN][entry.entry_id] = {

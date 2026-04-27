@@ -28,7 +28,6 @@ async def async_setup_entry(
         [
             HomePlusSecurityWebsocketConnectedBinarySensor(coordinator, entry.entry_id),
             HomePlusSecurityCloudWebSocketBinarySensor(coordinator, entry.entry_id),
-            HomePlusSecurityCloudWebSocketStaleBinarySensor(coordinator, entry.entry_id),
         ]
     )
 

@@ -16,8 +16,6 @@ CONF_HOME_ID = "home_id"
 CONF_HOME_NAME = "home_name"
 
 CONF_TOKEN_URL = "token_url"
-# Legacy key kept for backward compatibility with <=0.0.3 entries.
-CONF_API_BASE_URL = "api_base_url"
 CONF_APP_API_BASE_URL = "app_api_base_url"
 CONF_SYNC_API_BASE_URL = "sync_api_base_url"
 CONF_TURN_API_BASE_URL = "turn_api_base_url"

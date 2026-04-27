@@ -48,6 +48,8 @@ class HomePlusSecurityWsManager:
         self._running = False
         self._ws: ClientWebSocketResponse | None = None
         self._ws_last_message_monotonic = 0.0
+        self._ssl_context: ssl.SSLContext | None = None
+        self._ssl_lock = asyncio.Lock()
 
     async def async_start(self) -> None:
         """Start background connection manager."""
@@ -91,7 +93,7 @@ class HomePlusSecurityWsManager:
 
     async def _async_connect_and_listen(self) -> None:
         """Open websocket, subscribe, then keep listener loop alive."""
-        ssl_context = ssl.create_default_context()
+        ssl_context = await self._async_get_ssl_context()
         self._ws = await self._session.ws_connect(
             PUSH_WS_URL,
             ssl=ssl_context,
@@ -177,6 +179,17 @@ class HomePlusSecurityWsManager:
         if ws and not ws.closed:
             with suppress(ClientError):
                 await ws.close()
+
+    async def _async_get_ssl_context(self) -> ssl.SSLContext:
+        """Create SSL context outside the event loop and reuse it."""
+        if self._ssl_context is not None:
+            return self._ssl_context
+
+        async with self._ssl_lock:
+            if self._ssl_context is None:
+                self._ssl_context = await asyncio.to_thread(ssl.create_default_context)
+
+        return self._ssl_context
 
 
 class HomePlusSecurityWsError(Exception):

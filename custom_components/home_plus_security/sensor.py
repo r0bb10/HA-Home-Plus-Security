@@ -29,8 +29,6 @@ async def async_setup_entry(
             HomePlusSecurityWifiStrengthSensor(coordinator, entry.entry_id),
             HomePlusSecurityUptimeSensor(coordinator, entry.entry_id),
             HomePlusSecurityLocalIpSensor(coordinator, entry.entry_id),
-            HomePlusSecurityWebSocketLastMessageSensor(coordinator, entry.entry_id),
-            HomePlusSecurityLastCommandErrorSensor(coordinator, entry.entry_id),
         ]
     )
 

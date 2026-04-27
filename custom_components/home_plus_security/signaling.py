@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from contextlib import suppress
 import logging
 import ssl
@@ -27,11 +28,14 @@ class HomePlusSecuritySignalingClient:
         self._listener_task: asyncio.Task[None] | None = None
         self._pending_offer_ack: asyncio.Future[dict[str, Any]] | None = None
         self._lock = asyncio.Lock()
+        self._ssl_lock = asyncio.Lock()
 
         self._session_id: str | None = None
         self._tag_id: str | None = None
         self._device_id: str | None = None
         self._correlation_id: str | None = None
+        self._session_callbacks: dict[str, Callable[[dict[str, Any]], None]] = {}
+        self._ssl_context: ssl.SSLContext | None = None
 
     @property
     def session_id(self) -> str | None:
@@ -55,7 +59,14 @@ class HomePlusSecuritySignalingClient:
         async with self._lock:
             await self._async_disconnect_locked()
 
-    async def async_send_offer(self, *, device_id: str, sdp: str, module_id: str | None = None) -> str:
+    async def async_send_offer(
+        self,
+        *,
+        device_id: str,
+        sdp: str,
+        module_id: str | None = None,
+        on_session_message: Callable[[dict[str, Any]], None] | None = None,
+    ) -> str:
         """Send offer and wait for ack that includes session metadata."""
         await self.async_ensure_connected()
         if not self._ws:
@@ -90,9 +101,19 @@ class HomePlusSecuritySignalingClient:
         finally:
             self._pending_offer_ack = None
 
+        if ack.get("status") == "error":
+            error = ack.get("error")
+            if isinstance(error, dict):
+                message = error.get("message")
+                if isinstance(message, str) and message:
+                    raise HomePlusSecuritySignalingError(message)
+            raise HomePlusSecuritySignalingError(f"Offer rejected: {ack}")
+
         session_id = ack.get("session_id")
         if not isinstance(session_id, str) or not session_id:
             raise HomePlusSecuritySignalingError("Offer ack did not include session_id.")
+        if on_session_message is not None:
+            self._session_callbacks[session_id] = on_session_message
         return session_id
 
     async def async_send_candidate(self, *, sdp_m_line_index: int, candidate: str) -> None:
@@ -116,9 +137,23 @@ class HomePlusSecuritySignalingClient:
 
     async def async_send_terminate(self) -> None:
         """Terminate active call session."""
+        old_session_id = self._session_id
         await self._async_send_rtc_action(action_type="terminate", data={})
         self._session_id = None
         self._tag_id = None
+        if old_session_id:
+            self._session_callbacks.pop(old_session_id, None)
+
+    def async_set_session_callback(
+        self,
+        session_id: str,
+        callback: Callable[[dict[str, Any]], None] | None,
+    ) -> None:
+        """Set or clear callback for one signaling session."""
+        if callback is None:
+            self._session_callbacks.pop(session_id, None)
+            return
+        self._session_callbacks[session_id] = callback
 
     async def _async_send_rtc_action(self, *, action_type: str, data: dict[str, Any]) -> None:
         await self.async_ensure_connected()
@@ -138,7 +173,7 @@ class HomePlusSecuritySignalingClient:
         await self._ws.send_json(payload)
 
     async def _async_connect_locked(self) -> None:
-        ssl_context = ssl.create_default_context()
+        ssl_context = await self._async_get_ssl_context()
         self._ws = await self._session.ws_connect(
             SIGNALING_WS_URL,
             ssl=ssl_context,
@@ -166,6 +201,7 @@ class HomePlusSecuritySignalingClient:
         self._tag_id = None
         self._device_id = None
         self._correlation_id = None
+        self._session_callbacks.clear()
         if self._pending_offer_ack and not self._pending_offer_ack.done():
             self._pending_offer_ack.cancel()
         self._pending_offer_ack = None
@@ -221,9 +257,33 @@ class HomePlusSecuritySignalingClient:
         data = payload.get("data")
         if not isinstance(data, dict):
             return
+
+        session_id = payload.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            callback = self._session_callbacks.get(session_id)
+            if callback:
+                try:
+                    callback(payload)
+                except Exception:  # noqa: BLE001 - do not break listener on callback errors
+                    _LOGGER.debug("Signaling session callback failed", exc_info=True)
+
         if data.get("type") == "terminate":
-            self._session_id = None
-            self._tag_id = None
+            if isinstance(session_id, str) and session_id:
+                self._session_callbacks.pop(session_id, None)
+                if self._session_id == session_id:
+                    self._session_id = None
+                    self._tag_id = None
+
+    async def _async_get_ssl_context(self) -> ssl.SSLContext:
+        """Create SSL context outside the event loop and reuse it."""
+        if self._ssl_context is not None:
+            return self._ssl_context
+
+        async with self._ssl_lock:
+            if self._ssl_context is None:
+                self._ssl_context = await asyncio.to_thread(ssl.create_default_context)
+
+        return self._ssl_context
 
 
 class HomePlusSecuritySignalingError(Exception):
