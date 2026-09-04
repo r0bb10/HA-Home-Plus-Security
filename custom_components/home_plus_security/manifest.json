@@ -12,6 +12,9 @@
   "loggers": [
     "custom_components.home_plus_security"
   ],
+  "dependencies": [
+    "http"
+  ],
   "requirements": [],
   "version": "0.0.7"
 }
