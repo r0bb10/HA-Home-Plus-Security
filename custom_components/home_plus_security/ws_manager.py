@@ -103,7 +103,6 @@ class HomePlusSecurityWsManager:
 
         await self._async_subscribe()
         self._coordinator.mark_ws_connected()
-        self._coordinator.note_ws_message()
         self._ws_last_message_monotonic = time.monotonic()
 
         last_resubscribe = time.monotonic()
@@ -131,15 +130,13 @@ class HomePlusSecurityWsManager:
             if msg.type != WSMsgType.TEXT:
                 continue
 
-            self._ws_last_message_monotonic = time.monotonic()
-            self._coordinator.note_ws_message()
-
             try:
                 payload = msg.json()
             except ValueError:
                 _LOGGER.debug("Push ws non-JSON message: %s", msg.data)
                 continue
-            await self._handle_message(payload)
+            if await self._handle_message(payload):
+                self._ws_last_message_monotonic = time.monotonic()
 
     async def _async_subscribe(self) -> None:
         if not self._ws:
@@ -163,14 +160,14 @@ class HomePlusSecurityWsManager:
         if not isinstance(payload, dict) or payload.get("status") != "ok":
             raise HomePlusSecurityWsError(f"Push subscribe rejected: {payload}")
 
-    async def _handle_message(self, payload: Any) -> None:
-        """Process push message.
-
-        We keep this lightweight for now and rely on coordinator polling for state.
-        """
-        if not isinstance(payload, dict):
-            return
-        _LOGGER.debug("Push ws message: %s", payload)
+    async def _handle_message(self, payload: Any) -> bool:
+        """Process a push message without logging sensitive payload contents."""
+        if not isinstance(payload, dict) or not isinstance(payload.get("extra_params"), dict):
+            return False
+        if await self._coordinator.async_process_push_message(payload):
+            self._coordinator.async_request_refresh()
+        self._coordinator.note_ws_application_message()
+        return True
 
     async def _async_disconnect(self) -> None:
         ws = self._ws

@@ -18,6 +18,8 @@ from .const import (
     DOMAIN,
     WS_STALE_THRESHOLD_SECONDS,
 )
+from .history import HomePlusSecurityEventHistory
+from .push import HomePlusSecurityPushEvent, parse_push_event
 
 _LOGGER = logging.getLogger(__name__)
 _T = TypeVar("_T")
@@ -26,7 +28,7 @@ _T = TypeVar("_T")
 class HomePlusSecurityDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Coordinator for app API data."""
 
-    def __init__(self, hass, client: HomePlusSecurityApiClient, home_id: str) -> None:
+    def __init__(self, hass, client: HomePlusSecurityApiClient, home_id: str, entry_id: str) -> None:
         super().__init__(
             hass,
             logger=_LOGGER,
@@ -35,14 +37,19 @@ class HomePlusSecurityDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]
         )
         self.client = client
         self.home_id = home_id
+        self.history = HomePlusSecurityEventHistory(hass, entry_id)
 
         self._command_lock = asyncio.Lock()
         self._last_command_at_monotonic = 0.0
         self._last_command_error: str | None = None
 
         self._ws_connected = False
+        self._ws_connected_at: datetime | None = None
         self._ws_last_message_at: datetime | None = None
         self._ws_stale = False
+        self._active_calls: dict[str, dict[str, Any]] = {}
+        self._closed_sessions: dict[str, datetime] = {}
+        self._last_push_event: dict[str, Any] | None = None
 
     @property
     def last_command_error(self) -> str | None:
@@ -62,6 +69,7 @@ class HomePlusSecurityDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]
     def mark_ws_connected(self) -> None:
         """Mark websocket as connected."""
         self._ws_connected = True
+        self._ws_connected_at = datetime.now(UTC)
         self._ws_stale = False
         self._publish_runtime_state()
 
@@ -70,11 +78,184 @@ class HomePlusSecurityDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]
         self._ws_connected = False
         self._publish_runtime_state()
 
-    def note_ws_message(self) -> None:
-        """Update websocket activity heartbeat."""
+    def note_ws_application_message(self) -> None:
+        """Update the heartbeat after a recognized application push."""
         self._ws_last_message_at = datetime.now(UTC)
         self._ws_stale = False
         self._publish_runtime_state()
+
+    async def async_load_history(self) -> None:
+        """Load persisted push-event metadata before the websocket starts."""
+        await self.history.async_load()
+
+    async def async_process_push_message(self, payload: Any) -> bool:
+        """Apply a push message and preserve its images before publishing state."""
+        if not self.process_push_message(payload, publish=False):
+            return False
+        await self._async_store_push_images()
+        self._publish_push_state()
+        return True
+
+    def process_push_message(self, payload: Any, *, publish: bool = True) -> bool:
+        """Apply a supported push event and notify coordinator listeners.
+
+        SDP and other signaling material remain private to the active-call
+        record. Coordinator data only exposes the state needed by entities.
+        """
+        event = parse_push_event(payload)
+        if event is None:
+            return False
+
+        if event.event_type == "offer":
+            return self._process_rtc_offer(event, publish=publish)
+        if event.event_type in {"rescind", "terminate"}:
+            return self._process_rtc_close(event, publish=publish)
+        return self._process_call_status(event, publish=publish)
+
+    def _process_rtc_offer(self, event: HomePlusSecurityPushEvent, *, publish: bool) -> bool:
+        module_id = event.module_id or event.device_id
+        if module_id is None:
+            _LOGGER.debug("Ignoring RTC offer without a module or device ID.")
+            return False
+
+        existing = self._active_calls.get(module_id)
+        if existing and existing.get("session_id") == event.session_id:
+            existing["last_seen_at"] = datetime.now(UTC)
+            return False
+
+        now = datetime.now(UTC)
+        ring_id = event.session_id or f"{module_id}:{now.timestamp()}"
+        self._active_calls[module_id] = {
+            "module_id": module_id,
+            "device_id": event.device_id,
+            "session_id": event.session_id,
+            "tag_id": event.tag_id,
+            "correlation_id": event.correlation_id,
+            "sdp": event.sdp,
+            "modules": event.modules,
+            "ring_id": ring_id,
+            "started_at": now,
+            "last_seen_at": now,
+            "state": "incoming_call",
+        }
+        self._last_push_event = self._event_data(event, module_id, "incoming_call", ring_id)
+        if publish:
+            self._publish_push_state()
+        return True
+
+    def _process_rtc_close(self, event: HomePlusSecurityPushEvent, *, publish: bool) -> bool:
+        module_id = self._find_call_module(event)
+        if module_id is None:
+            return False
+
+        call = self._active_calls.get(module_id)
+        session_id = event.session_id or (call.get("session_id") if call else None)
+        if session_id and session_id in self._closed_sessions:
+            return False
+
+        self._active_calls.pop(module_id, None)
+        if session_id:
+            self._closed_sessions[session_id] = datetime.now(UTC)
+            while len(self._closed_sessions) > 32:
+                self._closed_sessions.pop(next(iter(self._closed_sessions)))
+        self._last_push_event = self._event_data(event, module_id, event.event_type)
+        if publish:
+            self._publish_push_state()
+        return True
+
+    def _process_call_status(self, event: HomePlusSecurityPushEvent, *, publish: bool) -> bool:
+        module_id = self._find_call_module(event) or event.module_id or event.device_id
+        if module_id is None:
+            _LOGGER.debug("Ignoring call status event without a module or device ID.")
+            return False
+
+        call = self._active_calls.get(module_id)
+        if event.event_type == "incoming_call" and call is None:
+            now = datetime.now(UTC)
+            call = {
+                "module_id": module_id,
+                "device_id": event.device_id,
+                "session_id": event.session_id,
+                "ring_id": event.session_id or f"{module_id}:{now.timestamp()}",
+                "started_at": now,
+                "last_seen_at": now,
+                "state": "incoming_call",
+            }
+            self._active_calls[module_id] = call
+        if call:
+            call["last_seen_at"] = datetime.now(UTC)
+            if event.event_type == "incoming_call":
+                call["snapshot_url"] = event.snapshot_url
+                call["vignette_url"] = event.vignette_url
+            elif event.event_type == "accepted_call":
+                call["state"] = "accepted_call"
+        if event.event_type == "missed_call":
+            self._active_calls.pop(module_id, None)
+
+        self._last_push_event = self._event_data(
+            event,
+            module_id,
+            event.event_type,
+            call.get("ring_id") if call and event.event_type == "incoming_call" else None,
+        )
+        if publish:
+            self._publish_push_state()
+        return True
+
+    async def _async_store_push_images(self) -> None:
+        """Persist incoming-call media and discard expiring URLs from public state."""
+        event = self._last_push_event
+        if not isinstance(event, dict) or event.get("type") != "incoming_call":
+            return
+        event_id = event.get("ring_id") or event.get("event_id") or event.get("session_id")
+        module_id = event.get("module_id")
+        if not isinstance(event_id, str) or not isinstance(module_id, str):
+            return
+        record = await self.history.async_record_images(
+            event_id=event_id,
+            module_id=module_id,
+            timestamp=event.get("timestamp"),
+            snapshot_url=event.get("snapshot_url"),
+            vignette_url=event.get("vignette_url"),
+        )
+        event["history_id"] = event_id
+        event["snapshot_available"] = bool(record.get("snapshot_file"))
+        event["vignette_available"] = bool(record.get("vignette_file"))
+        event["snapshot_url"] = None
+        event["vignette_url"] = None
+
+    def _find_call_module(self, event: HomePlusSecurityPushEvent) -> str | None:
+        if event.session_id:
+            for module_id, call in self._active_calls.items():
+                if call.get("session_id") == event.session_id:
+                    return module_id
+        if event.module_id in self._active_calls:
+            return event.module_id
+        if event.device_id in self._active_calls:
+            return event.device_id
+        if len(self._active_calls) == 1:
+            return next(iter(self._active_calls))
+        return None
+
+    @staticmethod
+    def _event_data(
+        event: HomePlusSecurityPushEvent,
+        module_id: str,
+        event_type: str,
+        ring_id: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "type": event_type,
+            "module_id": module_id,
+            "device_id": event.device_id,
+            "session_id": event.session_id,
+            "event_id": event.event_id,
+            "ring_id": ring_id,
+            "timestamp": event.timestamp,
+            "snapshot_url": event.snapshot_url,
+            "vignette_url": event.vignette_url,
+            "received_at": datetime.now(UTC).isoformat(),
+        }
 
     async def async_run_guarded_command(
         self,
@@ -194,8 +375,9 @@ class HomePlusSecurityDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]
                 "type": "BNCX",
             }
 
-        if self._ws_last_message_at:
-            silence_seconds = (datetime.now(UTC) - self._ws_last_message_at).total_seconds()
+        heartbeat_at = self._ws_last_message_at or self._ws_connected_at
+        if heartbeat_at:
+            silence_seconds = (datetime.now(UTC) - heartbeat_at).total_seconds()
             if silence_seconds > WS_STALE_THRESHOLD_SECONDS:
                 self._ws_stale = True
 
@@ -213,6 +395,7 @@ class HomePlusSecurityDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]
             "bncx_home": bncx_home if isinstance(bncx_home, dict) else {},
             "bncx_status": bncx_status if isinstance(bncx_status, dict) else {},
             "events": events,
+            "push": self._build_push_state(),
             "ws": self._build_ws_state(),
         }
 
@@ -224,9 +407,32 @@ class HomePlusSecurityDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]
             "last_command_error": self._last_command_error,
         }
 
+    def _build_push_state(self) -> dict[str, Any]:
+        active_calls = {
+            module_id: {
+                "module_id": call["module_id"],
+                "device_id": call["device_id"],
+                "session_id": call["session_id"],
+                "ring_id": call["ring_id"],
+                "state": call["state"],
+                "started_at": call["started_at"].isoformat(),
+                "last_seen_at": call["last_seen_at"].isoformat(),
+            }
+            for module_id, call in self._active_calls.items()
+        }
+        return {"active_calls": active_calls, "last_event": self._last_push_event}
+
     def _publish_runtime_state(self) -> None:
         if not isinstance(self.data, dict) or not self.data:
             return
         new_data = dict(self.data)
+        new_data["ws"] = self._build_ws_state()
+        self.async_set_updated_data(new_data)
+
+    def _publish_push_state(self) -> None:
+        if not isinstance(self.data, dict) or not self.data:
+            return
+        new_data = dict(self.data)
+        new_data["push"] = self._build_push_state()
         new_data["ws"] = self._build_ws_state()
         self.async_set_updated_data(new_data)
