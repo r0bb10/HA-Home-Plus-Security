@@ -20,6 +20,7 @@ from .const import (
 )
 from .history import HomePlusSecurityEventHistory
 from .push import HomePlusSecurityPushEvent, parse_push_event
+from .topology import normalize_modules
 
 _LOGGER = logging.getLogger(__name__)
 _T = TypeVar("_T")
@@ -322,11 +323,17 @@ class HomePlusSecurityDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]
         )
 
         status_home = homestatus.get("body", {}).get("home", {})
+        home_modules = selected_home.get("modules", [])
+        if not isinstance(home_modules, list):
+            home_modules = []
         status_modules = status_home.get("modules", [])
+        if not isinstance(status_modules, list):
+            status_modules = []
+        modules, modules_by_id = normalize_modules(home_modules, status_modules)
         bncx_home = next(
             (
                 module
-                for module in selected_home.get("modules", [])
+                for module in home_modules
                 if isinstance(module, dict) and module.get("type") == "BNCX"
             ),
             None,
@@ -395,6 +402,8 @@ class HomePlusSecurityDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]
             "bncx_home": bncx_home if isinstance(bncx_home, dict) else {},
             "bncx_status": bncx_status if isinstance(bncx_status, dict) else {},
             "events": events,
+            "modules": modules,
+            "modules_by_id": modules_by_id,
             "push": self._build_push_state(),
             "ws": self._build_ws_state(),
         }
