@@ -47,7 +47,7 @@ from .device import build_device_info
 from .signaling import HomePlusSecuritySignalingClient, HomePlusSecuritySignalingError
 from .ws_manager import HomePlusSecurityWsManager
 
-PLATFORMS: list[str] = ["sensor", "binary_sensor", "button", "camera"]
+PLATFORMS: list[str] = ["sensor", "binary_sensor", "button", "camera", "event"]
 HomePlusSecurityConfigEntry = ConfigEntry
 
 SERVICE_RTC_OFFER = "rtc_offer"
@@ -118,11 +118,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: HomePlusSecurityConfigEn
     if not home_id:
         raise ConfigEntryNotReady("Missing selected home_id in configuration.")
 
-    coordinator = HomePlusSecurityDataUpdateCoordinator(hass, client, home_id)
+    coordinator = HomePlusSecurityDataUpdateCoordinator(hass, client, home_id, entry.entry_id)
     ws_manager = HomePlusSecurityWsManager(session=session, client=client, coordinator=coordinator)
     signaling_client = HomePlusSecuritySignalingClient(session=session, client=client)
 
     try:
+        await coordinator.async_load_history()
         await coordinator.async_config_entry_first_refresh()
     except HomePlusSecurityAuthError as err:
         raise ConfigEntryAuthFailed(str(err)) from err

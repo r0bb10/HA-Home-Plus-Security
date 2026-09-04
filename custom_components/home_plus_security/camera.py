@@ -90,6 +90,7 @@ class HomePlusSecurityEventCamera(CoordinatorEntity, Camera):
         self._attr_name = "Last Snapshot" if image_type == "snapshot" else "Last Vignette"
         self._attr_unique_id = f"{entry_id}_{image_type}_camera"
         self._image_url: str | None = None
+        self._history_event_id: str | None = None
         self._image_expires_at: datetime | None = None
         self._event_time: datetime | None = None
         self._cached_image: bytes | None = None
@@ -98,7 +99,7 @@ class HomePlusSecurityEventCamera(CoordinatorEntity, Camera):
 
     @property
     def available(self) -> bool:
-        return super().available and self._image_url is not None
+        return super().available and (self._history_event_id is not None or self._image_url is not None)
 
     @property
     def device_info(self) -> DeviceInfo | None:
@@ -130,14 +131,32 @@ class HomePlusSecurityEventCamera(CoordinatorEntity, Camera):
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        previous = self._image_url
+        previous = (self._history_event_id, self._image_url)
         self._update_state()
-        if previous != self._image_url:
+        if previous != (self._history_event_id, self._image_url):
             self._cached_image = None
             self._cached_image_time = None
         self.async_write_ha_state()
 
     def _update_state(self) -> None:
+        push = self.coordinator.data.get("push", {})
+        last_push_event = push.get("last_event") if isinstance(push, dict) else None
+        if isinstance(last_push_event, dict):
+            history_id = last_push_event.get("history_id")
+            image_available = last_push_event.get(f"{self._image_type}_available")
+            if isinstance(history_id, str) and image_available is True:
+                self._history_event_id = history_id
+                self._image_url = None
+                self._image_expires_at = None
+                timestamp = last_push_event.get("timestamp")
+                self._event_time = (
+                    datetime.fromtimestamp(timestamp, UTC)
+                    if isinstance(timestamp, (int, float)) and timestamp > 0
+                    else None
+                )
+                return
+
+        self._history_event_id = None
         events = self.coordinator.data.get("events", [])
         if not isinstance(events, list):
             self._image_url = None
@@ -187,6 +206,18 @@ class HomePlusSecurityEventCamera(CoordinatorEntity, Camera):
             and (now - self._cached_image_time).total_seconds() < IMAGE_CACHE_SECONDS
         ):
             return self._cached_image
+
+        if self._history_event_id:
+            stored = await self.coordinator.history.async_read_image(
+                self._history_event_id, self._image_type
+            )
+            if stored is None:
+                return None
+            content, content_type = stored
+            self._attr_content_type = content_type
+            self._cached_image = content
+            self._cached_image_time = now
+            return content
 
         if not self._image_url:
             return None

@@ -5,10 +5,10 @@
     "@r0bb10"
   ],
   "config_flow": true,
-  "documentation": "https://github.com/r0bb10/home-plus-security",
+  "documentation": "https://github.com/r0bb10/HA-Home-Plus-Security",
   "integration_type": "hub",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/r0bb10/home-plus-security/issues",
+  "issue_tracker": "https://github.com/r0bb10/HA-Home-Plus-Security/issues",
   "loggers": [
     "custom_components.home_plus_security"
   ],

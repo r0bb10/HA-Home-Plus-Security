@@ -9,7 +9,7 @@ Project scaffold is ready for development and publication:
 - Config flow and options flow
 - Dedicated integration domain: `home_plus_security`
 - Naming in Home Assistant UI: `Home + Security`
-- Repository: `https://github.com/r0bb10/home-plus-security`
+- Repository: `https://github.com/r0bb10/HA-Home-Plus-Security`
 
 Runtime entities/services and the full API client implementation are the next step.
 
