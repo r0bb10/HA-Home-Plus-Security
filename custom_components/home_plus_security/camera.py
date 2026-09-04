@@ -386,7 +386,7 @@ class HomePlusSecurityLiveCamera(CoordinatorEntity, Camera):
                 state.pending_candidates.append(candidate)
                 return
 
-        await self._async_send_candidate(candidate)
+        await self._async_send_candidate(state, candidate)
 
     @callback
     def close_webrtc_session(self, session_id: str) -> None:
@@ -414,13 +414,14 @@ class HomePlusSecurityLiveCamera(CoordinatorEntity, Camera):
                 pending: list[RTCIceCandidateInit] = []
                 async with self._session_lock:
                     live = self._sessions.get(ha_session_id)
-                    if live is not None:
-                        live.answer_received = True
-                        live.answer_event.set()
-                        pending = list(live.pending_candidates)
-                        live.pending_candidates.clear()
+                    if live is None:
+                        return
+                    live.answer_received = True
+                    live.answer_event.set()
+                    pending = list(live.pending_candidates)
+                    live.pending_candidates.clear()
                 for pending_candidate in pending:
-                    await self._async_send_candidate(pending_candidate)
+                    await self._async_send_candidate(live, pending_candidate)
             return
 
         if msg_type == "candidate":
@@ -447,8 +448,12 @@ class HomePlusSecurityLiveCamera(CoordinatorEntity, Camera):
             state.send_message(WebRTCError("webrtc_terminated", "Remote session terminated"))
             await self._async_close_session(ha_session_id, send_terminate=False)
 
-    async def _async_send_candidate(self, candidate: RTCIceCandidateInit) -> None:
-        """Forward one browser ICE candidate to upstream signaling session."""
+    async def _async_send_candidate(
+        self, state: _LiveSessionState, candidate: RTCIceCandidateInit
+    ) -> None:
+        """Forward one browser ICE candidate to its matching upstream session."""
+        if not state.upstream_session_id or self._signaling.session_id != state.upstream_session_id:
+            raise HomeAssistantError("WebRTC session is no longer active upstream.")
         sdp_m_line_index = candidate.sdp_m_line_index if candidate.sdp_m_line_index is not None else 0
         await self._signaling.async_send_candidate(
             sdp_m_line_index=sdp_m_line_index,

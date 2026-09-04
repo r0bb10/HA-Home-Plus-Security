@@ -46,6 +46,7 @@ from .coordinator import HomePlusSecurityDataUpdateCoordinator
 from .device import build_device_info
 from .signaling import HomePlusSecuritySignalingClient, HomePlusSecuritySignalingError
 from .ws_manager import HomePlusSecurityWsManager
+from .media_source import HomePlusSecurityHistoryImageView
 
 PLATFORMS: list[str] = ["sensor", "binary_sensor", "button", "camera", "event"]
 HomePlusSecurityConfigEntry = ConfigEntry
@@ -54,6 +55,7 @@ SERVICE_RTC_OFFER = "rtc_offer"
 SERVICE_RTC_NEXT_MODULE = "rtc_next_module"
 SERVICE_RTC_TERMINATE = "rtc_terminate"
 _DATA_SERVICES_REGISTERED = f"{DOMAIN}_services_registered"
+_DATA_HISTORY_VIEW_REGISTERED = f"{DOMAIN}_history_view_registered"
 
 
 def _entry_value(entry: ConfigEntry, key: str, default: str = "") -> str:
@@ -159,6 +161,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: HomePlusSecurityConfigEn
         CONF_HOME_ID: home_id,
         CONF_HOME_NAME: _entry_value(entry, CONF_HOME_NAME),
     }
+
+    if not hass.data.get(_DATA_HISTORY_VIEW_REGISTERED):
+        hass.http.register_view(HomePlusSecurityHistoryImageView())
+        hass.data[_DATA_HISTORY_VIEW_REGISTERED] = True
 
     await _async_register_services(hass)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

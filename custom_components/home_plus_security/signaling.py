@@ -28,6 +28,7 @@ class HomePlusSecuritySignalingClient:
         self._listener_task: asyncio.Task[None] | None = None
         self._pending_offer_ack: asyncio.Future[dict[str, Any]] | None = None
         self._lock = asyncio.Lock()
+        self._offer_lock = asyncio.Lock()
         self._ssl_lock = asyncio.Lock()
 
         self._session_id: str | None = None
@@ -68,53 +69,56 @@ class HomePlusSecuritySignalingClient:
         on_session_message: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
         """Send offer and wait for ack that includes session metadata."""
-        await self.async_ensure_connected()
-        if not self._ws:
-            raise HomePlusSecuritySignalingError("Signaling websocket is not connected.")
+        async with self._offer_lock:
+            await self.async_ensure_connected()
+            if not self._ws:
+                raise HomePlusSecuritySignalingError("Signaling websocket is not connected.")
 
-        correlation_id = str(int(time.time() * 1000))
-        self._device_id = device_id
-        self._correlation_id = correlation_id
+            correlation_id = str(int(time.time() * 1000))
+            self._device_id = device_id
+            self._correlation_id = correlation_id
 
-        session_description: dict[str, Any] = {"type": "call", "sdp": sdp}
-        if module_id:
-            session_description["module_id"] = module_id
+            session_description: dict[str, Any] = {"type": "call", "sdp": sdp}
+            if module_id:
+                session_description["module_id"] = module_id
 
-        offer_payload = {
-            "action": "rtc",
-            "data": {
-                "type": "offer",
-                "session_description": session_description,
-            },
-            "device_id": device_id,
-            "correlation_id": correlation_id,
-        }
+            offer_payload = {
+                "action": "rtc",
+                "data": {
+                    "type": "offer",
+                    "session_description": session_description,
+                },
+                "device_id": device_id,
+                "correlation_id": correlation_id,
+            }
 
-        loop = asyncio.get_running_loop()
-        self._pending_offer_ack = loop.create_future()
-        await self._ws.send_json(offer_payload)
+            loop = asyncio.get_running_loop()
+            self._pending_offer_ack = loop.create_future()
+            try:
+                await self._ws.send_json(offer_payload)
+                ack = await asyncio.wait_for(self._pending_offer_ack, timeout=30)
+            except TimeoutError as err:
+                raise HomePlusSecuritySignalingError("Timeout waiting for offer ack.") from err
+            except ClientError as err:
+                await self.async_disconnect()
+                raise HomePlusSecuritySignalingError("Failed to send WebRTC offer.") from err
+            finally:
+                self._pending_offer_ack = None
 
-        try:
-            ack = await asyncio.wait_for(self._pending_offer_ack, timeout=30)
-        except TimeoutError as err:
-            raise HomePlusSecuritySignalingError("Timeout waiting for offer ack.") from err
-        finally:
-            self._pending_offer_ack = None
+            if ack.get("status") == "error":
+                error = ack.get("error")
+                if isinstance(error, dict):
+                    message = error.get("message")
+                    if isinstance(message, str) and message:
+                        raise HomePlusSecuritySignalingError(message)
+                raise HomePlusSecuritySignalingError(f"Offer rejected: {ack}")
 
-        if ack.get("status") == "error":
-            error = ack.get("error")
-            if isinstance(error, dict):
-                message = error.get("message")
-                if isinstance(message, str) and message:
-                    raise HomePlusSecuritySignalingError(message)
-            raise HomePlusSecuritySignalingError(f"Offer rejected: {ack}")
-
-        session_id = ack.get("session_id")
-        if not isinstance(session_id, str) or not session_id:
-            raise HomePlusSecuritySignalingError("Offer ack did not include session_id.")
-        if on_session_message is not None:
-            self._session_callbacks[session_id] = on_session_message
-        return session_id
+            session_id = ack.get("session_id")
+            if not isinstance(session_id, str) or not session_id:
+                raise HomePlusSecuritySignalingError("Offer ack did not include session_id.")
+            if on_session_message is not None:
+                self._session_callbacks[session_id] = on_session_message
+            return session_id
 
     async def async_send_candidate(self, *, sdp_m_line_index: int, candidate: str) -> None:
         """Send ICE candidate in current session."""
@@ -184,6 +188,8 @@ class HomePlusSecuritySignalingClient:
         self._listener_task = asyncio.create_task(self._async_listener(), name="home_plus_security_signaling_listener")
 
     async def _async_disconnect_locked(self) -> None:
+        ws = self._ws
+        self._ws = None
         listener = self._listener_task
         self._listener_task = None
         if listener and not listener.done():
@@ -191,8 +197,6 @@ class HomePlusSecuritySignalingClient:
             with suppress(asyncio.CancelledError):
                 await listener
 
-        ws = self._ws
-        self._ws = None
         if ws and not ws.closed:
             with suppress(ClientError):
                 await ws.close()
@@ -226,20 +230,50 @@ class HomePlusSecuritySignalingClient:
             raise HomePlusSecuritySignalingError(f"Signaling subscribe rejected: {payload}")
 
     async def _async_listener(self) -> None:
-        if not self._ws:
+        ws = self._ws
+        if not ws:
             return
-        while self._ws and not self._ws.closed:
-            msg = await self._ws.receive()
-            if msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.CLOSING):
-                return
-            if msg.type == WSMsgType.ERROR:
-                return
-            if msg.type != WSMsgType.TEXT:
-                continue
-            payload = msg.json()
-            if not isinstance(payload, dict):
-                continue
-            await self._async_handle_message(payload)
+        try:
+            while self._ws is ws and not ws.closed:
+                msg = await ws.receive()
+                if msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.CLOSING):
+                    return
+                if msg.type == WSMsgType.ERROR:
+                    _LOGGER.debug("Signaling websocket listener error: %s", ws.exception())
+                    return
+                if msg.type != WSMsgType.TEXT:
+                    continue
+                try:
+                    payload = msg.json()
+                except ValueError:
+                    _LOGGER.debug("Ignoring non-JSON signaling message")
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                await self._async_handle_message(payload)
+        except asyncio.CancelledError:
+            raise
+        except ClientError:
+            _LOGGER.debug("Signaling websocket listener failed", exc_info=True)
+        except Exception:  # noqa: BLE001 - listener failure must permit reconnect
+            _LOGGER.debug("Signaling websocket listener stopped unexpectedly", exc_info=True)
+        finally:
+            self._handle_listener_exit(ws)
+
+    def _handle_listener_exit(self, ws: ClientWebSocketResponse) -> None:
+        """Clear a dead listener's socket and wake an in-flight offer."""
+        if self._ws is not ws:
+            return
+        self._ws = None
+        self._session_id = None
+        self._tag_id = None
+        self._device_id = None
+        self._correlation_id = None
+        self._session_callbacks.clear()
+        if self._pending_offer_ack and not self._pending_offer_ack.done():
+            self._pending_offer_ack.set_exception(
+                HomePlusSecuritySignalingError("Signaling websocket disconnected during offer.")
+            )
 
     async def _async_handle_message(self, payload: dict[str, Any]) -> None:
         top_type = payload.get("type")

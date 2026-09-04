@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+import hashlib
 import logging
 from pathlib import Path
 from typing import Any
@@ -72,8 +73,12 @@ class HomePlusSecurityEventHistory:
                     "timestamp": timestamp or datetime.now(UTC).timestamp(),
                     "snapshot_file": None,
                     "snapshot_content_type": None,
+                    "snapshot_bytes": None,
+                    "snapshot_sha256": None,
                     "vignette_file": None,
                     "vignette_content_type": None,
+                    "vignette_bytes": None,
+                    "vignette_sha256": None,
                 }
                 self._events.insert(0, record)
 
@@ -83,9 +88,11 @@ class HomePlusSecurityEventHistory:
                 downloaded = await self._async_download_image(module_id, event_id, image_kind, url)
                 if downloaded is None:
                     continue
-                filename, content_type = downloaded
+                filename, content_type, size, digest = downloaded
                 record[f"{image_kind}_file"] = filename
                 record[f"{image_kind}_content_type"] = content_type
+                record[f"{image_kind}_bytes"] = size
+                record[f"{image_kind}_sha256"] = digest
 
             await self._async_apply_retention_locked()
             await self._store.async_save({"events": self._events})
@@ -111,9 +118,43 @@ class HomePlusSecurityEventHistory:
             _LOGGER.debug("Unable to read stored %s image for event %s", image_kind, event_id)
             return None
 
+    def list_events(self, module_id: str | None = None) -> list[dict[str, Any]]:
+        """Return persisted metadata, newest event first."""
+        events = self._events
+        if module_id is not None:
+            events = [event for event in events if event.get("module_id") == module_id]
+        return [dict(event) for event in events]
+
+    def get_event(self, event_id: str) -> dict[str, Any] | None:
+        """Return metadata for one event."""
+        event = next((item for item in self._events if item.get("event_id") == event_id), None)
+        return dict(event) if event is not None else None
+
+    def list_modules(self) -> list[str]:
+        """Return modules with at least one stored event."""
+        return list(dict.fromkeys(
+            event["module_id"]
+            for event in self._events
+            if isinstance(event.get("module_id"), str)
+        ))
+
+    def resolve_image_path(self, event_id: str, image_kind: str) -> tuple[Path, str] | None:
+        """Resolve one history image to its safe local path and MIME type."""
+        if image_kind not in _IMAGE_KINDS:
+            return None
+        event = self.get_event(event_id)
+        if event is None:
+            return None
+        filename = event.get(f"{image_kind}_file")
+        content_type = event.get(f"{image_kind}_content_type")
+        if not isinstance(filename, str) or not isinstance(content_type, str):
+            return None
+        path = self._safe_path(filename)
+        return (path, content_type) if path is not None else None
+
     async def _async_download_image(
         self, module_id: str, event_id: str, image_kind: str, url: str
-    ) -> tuple[str, str] | None:
+    ) -> tuple[str, str, int, str] | None:
         parsed = urlparse(url)
         if parsed.scheme != "https" or not parsed.netloc:
             _LOGGER.warning("Rejected non-HTTPS %s URL for event %s", image_kind, event_id)
@@ -151,7 +192,7 @@ class HomePlusSecurityEventHistory:
         except OSError as err:
             _LOGGER.warning("Unable to store %s image for event %s: %s", image_kind, event_id, err)
             return None
-        return filename, content_type
+        return filename, content_type, len(content), hashlib.sha256(content).hexdigest()
 
     async def _async_apply_retention_locked(self) -> None:
         cutoff = (datetime.now(UTC) - timedelta(days=HISTORY_RETENTION_DAYS)).timestamp()
