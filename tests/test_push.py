@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import sys
 import unittest
@@ -73,3 +74,20 @@ class ParsePushEventTest(unittest.TestCase):
 
     def test_ignores_unknown_payload(self) -> None:
         self.assertIsNone(_PUSH.parse_push_event({"extra_params": {"event_type": "online"}}))
+
+    def test_prunes_only_calls_past_stale_threshold(self) -> None:
+        now = datetime(2026, 9, 4, tzinfo=UTC)
+        active_calls = {
+            "stale": {"last_seen_at": now - timedelta(seconds=301)},
+            "active": {"last_seen_at": now - timedelta(seconds=300)},
+            "future": {"last_seen_at": now + timedelta(seconds=1)},
+        }
+
+        stale_calls = _PUSH.prune_stale_calls(
+            active_calls,
+            now=now,
+            threshold_seconds=300,
+        )
+
+        self.assertEqual(set(stale_calls), {"stale", "active"})
+        self.assertEqual(set(active_calls), {"future"})

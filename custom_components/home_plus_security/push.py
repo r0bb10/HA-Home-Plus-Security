@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
 
 
@@ -88,3 +89,21 @@ def parse_push_event(payload: Any) -> HomePlusSecurityPushEvent | None:
         timestamp=timestamp if isinstance(timestamp, (int, float)) else None,
         event_id=_optional_str(extra_params.get("event_id")),
     )
+
+
+def prune_stale_calls(
+    active_calls: dict[str, dict[str, Any]],
+    *,
+    now: datetime,
+    threshold_seconds: float,
+) -> dict[str, dict[str, Any]]:
+    """Remove calls that have not received an update within the threshold."""
+    cutoff = now - timedelta(seconds=threshold_seconds)
+    stale_calls = {
+        module_id: call
+        for module_id, call in active_calls.items()
+        if not isinstance(call.get("last_seen_at"), datetime) or call["last_seen_at"] <= cutoff
+    }
+    for module_id in stale_calls:
+        active_calls.pop(module_id, None)
+    return stale_calls

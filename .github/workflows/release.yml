@@ -1,9 +1,9 @@
 name: "Release"
 
 on:
-  release:
-    types:
-      - "published"
+  push:
+    tags:
+      - "v*"
 
 permissions: {}
 
@@ -17,11 +17,17 @@ jobs:
       - name: "Checkout the repository"
         uses: "actions/checkout@main"
 
-      - name: "Adjust version number"
+      - name: "Set packaged manifest version"
         shell: "bash"
         run: |
-          yq -i -o json '.version="${{ github.event.release.tag_name }}"' \
-            "${{ github.workspace }}/custom_components/home_plus_security/manifest.json"
+          version="${GITHUB_REF_NAME#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tags must use vMAJOR.MINOR.PATCH; got ${GITHUB_REF_NAME}." >&2
+            exit 1
+          fi
+          manifest="${{ github.workspace }}/custom_components/home_plus_security/manifest.json"
+          jq --arg version "$version" '.version = $version' "$manifest" > "$manifest.tmp"
+          mv "$manifest.tmp" "$manifest"
 
       - name: "ZIP the integration directory"
         shell: "bash"
@@ -33,3 +39,4 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: ${{ github.workspace }}/custom_components/home_plus_security/home_plus_security.zip
+          generate_release_notes: true

@@ -14,13 +14,14 @@ from .api import HomePlusSecurityApiClient, HomePlusSecurityApiError
 from .const import (
     COMMAND_COOLDOWN_SECONDS,
     COMMAND_TIMEOUT_SECONDS,
+    CALL_STALE_THRESHOLD_SECONDS,
     COORDINATOR_UPDATE_INTERVAL,
     DOMAIN,
     WS_STALE_THRESHOLD_SECONDS,
 )
 from .history import HomePlusSecurityEventHistory
 from .event_images import find_latest_event_media
-from .push import HomePlusSecurityPushEvent, parse_push_event
+from .push import HomePlusSecurityPushEvent, parse_push_event, prune_stale_calls
 from .topology import normalize_modules
 
 _LOGGER = logging.getLogger(__name__)
@@ -104,8 +105,11 @@ class HomePlusSecurityDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]
         SDP and other signaling material remain private to the active-call
         record. Coordinator data only exposes the state needed by entities.
         """
+        stale_calls_pruned = self._prune_stale_calls()
         event = parse_push_event(payload)
         if event is None:
+            if stale_calls_pruned and publish:
+                self._publish_push_state()
             return False
 
         if event.event_type == "offer":
@@ -298,13 +302,19 @@ class HomePlusSecurityDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from the API."""
+        stale_calls_pruned = self._prune_stale_calls()
         try:
             homesdata = await self.client.async_get_homesdata()
             homestatus = await self.client.async_get_homestatus(self.home_id)
         except Exception as err:  # noqa: BLE001 - preserve last-good payload on transient failure
             if isinstance(self.data, dict) and self.data:
                 _LOGGER.debug("Transient update failure, keeping last coordinator data: %s", err)
-                return self.data
+                if not stale_calls_pruned:
+                    return self.data
+                data = dict(self.data)
+                data["push"] = self._build_push_state()
+                data["ws"] = self._build_ws_state()
+                return data
             raise
 
         events_payload: dict[str, Any] = {}
@@ -410,6 +420,21 @@ class HomePlusSecurityDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]
             "push": self._build_push_state(),
             "ws": self._build_ws_state(),
         }
+
+    def _prune_stale_calls(self) -> bool:
+        """Clear orphaned calls when their final push message was lost."""
+        stale_calls = prune_stale_calls(
+            self._active_calls,
+            now=datetime.now(UTC),
+            threshold_seconds=CALL_STALE_THRESHOLD_SECONDS,
+        )
+        for call in stale_calls.values():
+            session_id = call.get("session_id")
+            if isinstance(session_id, str) and session_id:
+                self._closed_sessions[session_id] = datetime.now(UTC)
+        while len(self._closed_sessions) > 32:
+            self._closed_sessions.pop(next(iter(self._closed_sessions)))
+        return bool(stale_calls)
 
     async def _async_store_polled_event_images(self, events: list[dict[str, Any]]) -> dict[str, Any]:
         """Persist the latest API event media when no live push was received."""
