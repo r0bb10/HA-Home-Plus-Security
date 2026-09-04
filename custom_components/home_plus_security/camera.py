@@ -34,6 +34,7 @@ from .const import (
     IMAGE_CACHE_SECONDS,
 )
 from .device import build_device_info
+from .event_images import find_latest_event_media
 
 _LOGGER = logging.getLogger(__name__)
 _LIVE_ANSWER_TIMEOUT_SECONDS = 25
@@ -141,20 +142,10 @@ class HomePlusSecurityEventCamera(CoordinatorEntity, Camera):
     def _update_state(self) -> None:
         push = self.coordinator.data.get("push", {})
         last_push_event = push.get("last_event") if isinstance(push, dict) else None
-        if isinstance(last_push_event, dict):
-            history_id = last_push_event.get("history_id")
-            image_available = last_push_event.get(f"{self._image_type}_available")
-            if isinstance(history_id, str) and image_available is True:
-                self._history_event_id = history_id
-                self._image_url = None
-                self._image_expires_at = None
-                timestamp = last_push_event.get("timestamp")
-                self._event_time = (
-                    datetime.fromtimestamp(timestamp, UTC)
-                    if isinstance(timestamp, (int, float)) and timestamp > 0
-                    else None
-                )
-                return
+        if self._use_history_event(last_push_event):
+            return
+        if self._use_history_event(self.coordinator.data.get("event_media")):
+            return
 
         self._history_event_id = None
         events = self.coordinator.data.get("events", [])
@@ -164,39 +155,39 @@ class HomePlusSecurityEventCamera(CoordinatorEntity, Camera):
             self._event_time = None
             return
 
-        image_url: str | None = None
-        expires_at: datetime | None = None
-        event_time: datetime | None = None
-
-        for event in events:
-            if not isinstance(event, dict):
-                continue
-            subevents = event.get("subevents")
-            if not isinstance(subevents, list) or not subevents:
-                continue
-            first_subevent = subevents[0]
-            if not isinstance(first_subevent, dict):
-                continue
-            image_data = first_subevent.get(self._image_type)
-            if not isinstance(image_data, dict):
-                continue
-            url = image_data.get("url")
-            if not isinstance(url, str) or not url:
-                continue
-
-            image_url = url
-            expires_raw = image_data.get("expires_at")
-            if isinstance(expires_raw, (int, float)) and expires_raw > 0:
-                expires_at = datetime.fromtimestamp(expires_raw, UTC)
-
-            event_time_raw = first_subevent.get("time") or event.get("time")
-            if isinstance(event_time_raw, (int, float)) and event_time_raw > 0:
-                event_time = datetime.fromtimestamp(event_time_raw, UTC)
-            break
-
+        media = find_latest_event_media(events)
+        image_url = getattr(media, f"{self._image_type}_url") if media else None
+        expires_at = getattr(media, f"{self._image_type}_expires_at") if media else None
         self._image_url = image_url
-        self._image_expires_at = expires_at
-        self._event_time = event_time
+        self._image_expires_at = (
+            datetime.fromtimestamp(expires_at, UTC)
+            if isinstance(expires_at, (int, float)) and expires_at > 0
+            else None
+        )
+        self._event_time = (
+            datetime.fromtimestamp(media.timestamp, UTC)
+            if media and isinstance(media.timestamp, (int, float)) and media.timestamp > 0
+            else None
+        )
+
+    def _use_history_event(self, event: Any) -> bool:
+        """Select a locally persisted image when the event cache has it."""
+        if not isinstance(event, dict):
+            return False
+        history_id = event.get("history_id")
+        image_available = event.get(f"{self._image_type}_available")
+        if not isinstance(history_id, str) or image_available is not True:
+            return False
+        self._history_event_id = history_id
+        self._image_url = None
+        self._image_expires_at = None
+        timestamp = event.get("timestamp")
+        self._event_time = (
+            datetime.fromtimestamp(timestamp, UTC)
+            if isinstance(timestamp, (int, float)) and timestamp > 0
+            else None
+        )
+        return True
 
     async def async_camera_image(self, width: int | None = None, height: int | None = None) -> bytes | None:
         now = datetime.now(UTC)

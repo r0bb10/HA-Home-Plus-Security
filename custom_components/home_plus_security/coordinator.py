@@ -19,6 +19,7 @@ from .const import (
     WS_STALE_THRESHOLD_SECONDS,
 )
 from .history import HomePlusSecurityEventHistory
+from .event_images import find_latest_event_media
 from .push import HomePlusSecurityPushEvent, parse_push_event
 from .topology import normalize_modules
 
@@ -395,6 +396,7 @@ class HomePlusSecurityDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]
         )
         if not isinstance(events, list):
             events = []
+        polled_event_media = await self._async_store_polled_event_images(events)
 
         return {
             "home": selected_home,
@@ -402,10 +404,30 @@ class HomePlusSecurityDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]
             "bncx_home": bncx_home if isinstance(bncx_home, dict) else {},
             "bncx_status": bncx_status if isinstance(bncx_status, dict) else {},
             "events": events,
+            "event_media": polled_event_media,
             "modules": modules,
             "modules_by_id": modules_by_id,
             "push": self._build_push_state(),
             "ws": self._build_ws_state(),
+        }
+
+    async def _async_store_polled_event_images(self, events: list[dict[str, Any]]) -> dict[str, Any]:
+        """Persist the latest API event media when no live push was received."""
+        media = find_latest_event_media(events)
+        if media is None or not media.event_id or not media.module_id:
+            return {}
+        record = await self.history.async_record_images(
+            event_id=media.event_id,
+            module_id=media.module_id,
+            timestamp=media.timestamp,
+            snapshot_url=media.snapshot_url,
+            vignette_url=media.vignette_url,
+        )
+        return {
+            "history_id": media.event_id,
+            "timestamp": media.timestamp,
+            "snapshot_available": bool(record.get("snapshot_file")),
+            "vignette_available": bool(record.get("vignette_file")),
         }
 
     def _build_ws_state(self) -> dict[str, Any]:
