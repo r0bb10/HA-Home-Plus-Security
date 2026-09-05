@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from io import BytesIO
 import logging
 from typing import Any
 
@@ -39,6 +40,22 @@ from .event_images import find_latest_event_media
 _LOGGER = logging.getLogger(__name__)
 _LIVE_ANSWER_TIMEOUT_SECONDS = 25
 _TURN_REFRESH_FALLBACK_SECONDS = 3600
+
+
+def _resize_jpeg_thumbnail(content: bytes, width: int | None, height: int | None) -> bytes:
+    """Resize an event JPEG before HA's TurboJPEG thumbnail path can corrupt it."""
+    if width is None or height is None or width <= 0 or height <= 0:
+        return content
+    try:
+        from PIL import Image
+
+        with Image.open(BytesIO(content)) as image:
+            image.thumbnail((width, height), Image.Resampling.LANCZOS)
+            output = BytesIO()
+            image.save(output, format="JPEG", quality=85)
+            return output.getvalue()
+    except (ImportError, OSError, ValueError, ZeroDivisionError):
+        return content
 
 
 @dataclass
@@ -196,6 +213,10 @@ class HomePlusSecurityEventCamera(CoordinatorEntity, Camera):
             and self._cached_image_time is not None
             and (now - self._cached_image_time).total_seconds() < IMAGE_CACHE_SECONDS
         ):
+            if self.content_type == "image/jpeg":
+                return await self.hass.async_add_executor_job(
+                    _resize_jpeg_thumbnail, self._cached_image, width, height
+                )
             return self._cached_image
 
         if self._history_event_id:
@@ -205,9 +226,13 @@ class HomePlusSecurityEventCamera(CoordinatorEntity, Camera):
             if stored is None:
                 return None
             content, content_type = stored
-            self._attr_content_type = content_type
+            self.content_type = content_type
             self._cached_image = content
             self._cached_image_time = now
+            if content_type == "image/jpeg":
+                return await self.hass.async_add_executor_job(
+                    _resize_jpeg_thumbnail, content, width, height
+                )
             return content
 
         if not self._image_url:
@@ -220,12 +245,18 @@ class HomePlusSecurityEventCamera(CoordinatorEntity, Camera):
             async with session.get(self._image_url) as response:
                 response.raise_for_status()
                 content = await response.read()
+                content_type = response.content_type
         except ClientError as err:
             _LOGGER.debug("Failed to fetch %s camera image: %s", self._image_type, err)
             return None
 
         self._cached_image = content
         self._cached_image_time = now
+        self.content_type = content_type
+        if content_type == "image/jpeg":
+            return await self.hass.async_add_executor_job(
+                _resize_jpeg_thumbnail, content, width, height
+            )
         return content
 
 
@@ -245,6 +276,7 @@ class HomePlusSecurityLiveCamera(CoordinatorEntity, Camera):
         self._attr_unique_id = f"{entry_id}_live_camera"
         self._session_lock = asyncio.Lock()
         self._sessions: dict[str, _LiveSessionState] = {}
+        self._streaming_session_ids: set[str] = set()
         self._ice_servers: list[RTCIceServer] = []
         self._turn_expires_at: datetime | None = None
 
@@ -293,13 +325,54 @@ class HomePlusSecurityLiveCamera(CoordinatorEntity, Camera):
         }
         return {key: value for key, value in attrs.items() if value is not None}
 
+    @property
+    def is_streaming(self) -> bool:
+        """Report streaming after the device accepts a WebRTC answer."""
+        return bool(self._streaming_session_ids)
+
     async def async_camera_image(
         self,
         width: int | None = None,
         height: int | None = None,
     ) -> bytes | None:
-        """Live stream camera does not expose stills directly."""
-        return None
+        """Return the latest snapshot as the live camera thumbnail."""
+        push = self.coordinator.data.get("push", {})
+        events = [push.get("last_event") if isinstance(push, dict) else None, self.coordinator.data.get("event_media")]
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            history_id = event.get("history_id")
+            if isinstance(history_id, str) and event.get("snapshot_available") is True:
+                stored = await self.coordinator.history.async_read_image(history_id, "snapshot")
+                if stored is not None:
+                    content, content_type = stored
+                    self.content_type = content_type
+                    if content_type == "image/jpeg":
+                        return await self.hass.async_add_executor_job(
+                            _resize_jpeg_thumbnail, content, width, height
+                        )
+                    return content
+
+        events_data = self.coordinator.data.get("events", [])
+        media = find_latest_event_media(events_data) if isinstance(events_data, list) else None
+        if media is None or not media.snapshot_url:
+            return None
+        if media.snapshot_expires_at and datetime.now(UTC).timestamp() >= media.snapshot_expires_at:
+            return None
+        session = async_get_clientsession(self.hass)
+        try:
+            async with session.get(media.snapshot_url) as response:
+                response.raise_for_status()
+                self.content_type = response.content_type
+                content = await response.read()
+                if response.content_type == "image/jpeg":
+                    return await self.hass.async_add_executor_job(
+                        _resize_jpeg_thumbnail, content, width, height
+                    )
+                return content
+        except ClientError:
+            _LOGGER.debug("Failed to fetch live camera thumbnail", exc_info=True)
+            return None
 
     @callback
     def _async_get_webrtc_client_configuration(self) -> WebRTCClientConfiguration:
@@ -314,7 +387,6 @@ class HomePlusSecurityLiveCamera(CoordinatorEntity, Camera):
     ) -> None:
         """Send offer to Netatmo signaling and relay answer/candidates back to HA frontend."""
         await self._async_refresh_turn_configuration()
-
         await self._async_close_all_sessions(send_terminate=True)
         async with self._session_lock:
             self._sessions[session_id] = _LiveSessionState(
@@ -409,8 +481,10 @@ class HomePlusSecurityLiveCamera(CoordinatorEntity, Camera):
                         return
                     live.answer_received = True
                     live.answer_event.set()
+                    self._streaming_session_ids.add(ha_session_id)
                     pending = list(live.pending_candidates)
                     live.pending_candidates.clear()
+                self.async_write_ha_state()
                 for pending_candidate in pending:
                     await self._async_send_candidate(live, pending_candidate)
             return
@@ -459,6 +533,8 @@ class HomePlusSecurityLiveCamera(CoordinatorEntity, Camera):
         if state is None:
             return
 
+        self._streaming_session_ids.discard(ha_session_id)
+        self.async_write_ha_state()
         await self._async_finalize_session(state, send_terminate=send_terminate)
 
     async def _async_finalize_session(self, state: _LiveSessionState, *, send_terminate: bool) -> None:
@@ -476,6 +552,8 @@ class HomePlusSecurityLiveCamera(CoordinatorEntity, Camera):
     async def _async_close_all_sessions(self, *, send_terminate: bool) -> None:
         async with self._session_lock:
             states = [self._sessions.pop(session_id) for session_id in list(self._sessions)]
+            self._streaming_session_ids.clear()
+        self.async_write_ha_state()
         for state in states:
             await self._async_finalize_session(state, send_terminate=send_terminate)
 
