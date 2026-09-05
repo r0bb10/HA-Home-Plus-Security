@@ -10,8 +10,9 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DATA_CLIENT, DATA_COORDINATOR, DOMAIN
+from .const import DATA_CLIENT, DATA_COORDINATOR, DOMAIN, OPT_EXPOSE_UNLOCK
 from .device import build_device_info
+from .entity_options import remove_entity_if_disabled
 
 
 async def async_setup_entry(
@@ -23,7 +24,17 @@ async def async_setup_entry(
     data = hass.data[DOMAIN][entry.entry_id]
     coordinator = data[DATA_COORDINATOR]
     client = data[DATA_CLIENT]
-    async_add_entities([HomePlusSecurityUnlockButton(coordinator, client, entry.entry_id)])
+    button = HomePlusSecurityUnlockButton(coordinator, client, entry.entry_id)
+    if not remove_entity_if_disabled(
+        hass,
+        entry,
+        "button",
+        OPT_EXPOSE_UNLOCK,
+        button.unique_id,
+        default=True,
+    ):
+        return
+    async_add_entities([button])
 
 
 class HomePlusSecurityUnlockButton(CoordinatorEntity, ButtonEntity):

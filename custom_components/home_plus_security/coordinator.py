@@ -31,7 +31,15 @@ _T = TypeVar("_T")
 class HomePlusSecurityDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Coordinator for app API data."""
 
-    def __init__(self, hass, client: HomePlusSecurityApiClient, home_id: str, entry_id: str) -> None:
+    def __init__(
+        self,
+        hass,
+        client: HomePlusSecurityApiClient,
+        home_id: str,
+        entry_id: str,
+        *,
+        history: HomePlusSecurityEventHistory,
+    ) -> None:
         super().__init__(
             hass,
             logger=_LOGGER,
@@ -40,7 +48,7 @@ class HomePlusSecurityDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]
         )
         self.client = client
         self.home_id = home_id
-        self.history = HomePlusSecurityEventHistory(hass, entry_id)
+        self.history = history
 
         self._command_lock = asyncio.Lock()
         self._last_command_at_monotonic = 0.0
@@ -68,6 +76,11 @@ class HomePlusSecurityDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]
     def ws_stale(self) -> bool:
         """True when websocket appears silent/stale."""
         return self._ws_stale
+
+    @property
+    def ws_last_message_at(self) -> datetime | None:
+        """Timestamp of the last recognized application push message."""
+        return self._ws_last_message_at
 
     def mark_ws_connected(self) -> None:
         """Mark websocket as connected."""

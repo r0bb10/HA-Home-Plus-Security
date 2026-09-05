@@ -41,9 +41,15 @@ from .const import (
     DEFAULT_TOKEN_URL,
     DEFAULT_TURN_API_BASE_URL,
     DOMAIN,
+    HISTORY_MAX_EVENTS,
+    HISTORY_RETENTION_DAYS,
+    OPT_HISTORY_ENABLED,
+    OPT_HISTORY_MAX_EVENTS,
+    OPT_HISTORY_RETENTION_DAYS,
 )
 from .coordinator import HomePlusSecurityDataUpdateCoordinator
 from .device import build_device_info
+from .history import HomePlusSecurityEventHistory
 from .signaling import HomePlusSecuritySignalingClient, HomePlusSecuritySignalingError
 from .ws_manager import HomePlusSecurityWsManager
 from .media_source import HomePlusSecurityHistoryImageView
@@ -61,6 +67,18 @@ _DATA_HISTORY_VIEW_REGISTERED = f"{DOMAIN}_history_view_registered"
 def _entry_value(entry: ConfigEntry, key: str, default: str = "") -> str:
     value = entry.options.get(key, entry.data.get(key, default))
     return value if isinstance(value, str) else default
+
+
+def _entry_bool_option(entry: ConfigEntry, key: str, default: bool) -> bool:
+    value = entry.options.get(key, default)
+    return value if isinstance(value, bool) else default
+
+
+def _entry_int_option(entry: ConfigEntry, key: str, default: int, maximum: int) -> int:
+    value = entry.options.get(key, default)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return min(max(value, 1), maximum)
+    return default
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: HomePlusSecurityConfigEntry) -> bool:
@@ -120,7 +138,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: HomePlusSecurityConfigEn
     if not home_id:
         raise ConfigEntryNotReady("Missing selected home_id in configuration.")
 
-    coordinator = HomePlusSecurityDataUpdateCoordinator(hass, client, home_id, entry.entry_id)
+    history = HomePlusSecurityEventHistory(
+        hass,
+        entry.entry_id,
+        enabled=_entry_bool_option(entry, OPT_HISTORY_ENABLED, True),
+        retention_days=_entry_int_option(
+            entry, OPT_HISTORY_RETENTION_DAYS, HISTORY_RETENTION_DAYS, 365
+        ),
+        max_events=_entry_int_option(entry, OPT_HISTORY_MAX_EVENTS, HISTORY_MAX_EVENTS, 500),
+    )
+    coordinator = HomePlusSecurityDataUpdateCoordinator(
+        hass, client, home_id, entry.entry_id, history=history
+    )
     ws_manager = HomePlusSecurityWsManager(session=session, client=client, coordinator=coordinator)
     signaling_client = HomePlusSecuritySignalingClient(session=session, client=client)
 

@@ -33,8 +33,10 @@ from .const import (
     DATA_SIGNALING_CLIENT,
     DOMAIN,
     IMAGE_CACHE_SECONDS,
+    OPT_EXPOSE_CAMERAS,
 )
 from .device import build_device_info
+from .entity_options import remove_entity_if_disabled
 from .event_images import find_latest_event_media
 
 _LOGGER = logging.getLogger(__name__)
@@ -81,18 +83,35 @@ async def async_setup_entry(
     coordinator = runtime[DATA_COORDINATOR]
     client = runtime[DATA_CLIENT]
     signaling = runtime[DATA_SIGNALING_CLIENT]
-    async_add_entities(
-        [
-            HomePlusSecurityEventCamera(coordinator, entry.entry_id, image_type="snapshot"),
-            HomePlusSecurityEventCamera(coordinator, entry.entry_id, image_type="vignette"),
-            HomePlusSecurityLiveCamera(
-                coordinator=coordinator,
-                client=client,
-                signaling=signaling,
-                entry_id=entry.entry_id,
-            ),
-        ]
-    )
+    cameras = [
+        HomePlusSecurityEventCamera(coordinator, entry.entry_id, image_type="snapshot"),
+        HomePlusSecurityEventCamera(coordinator, entry.entry_id, image_type="vignette"),
+        HomePlusSecurityLiveCamera(
+            coordinator=coordinator,
+            client=client,
+            signaling=signaling,
+            entry_id=entry.entry_id,
+        ),
+    ]
+    if not remove_entity_if_disabled(
+        hass,
+        entry,
+        "camera",
+        OPT_EXPOSE_CAMERAS,
+        cameras[0].unique_id,
+        default=True,
+    ):
+        for camera in cameras[1:]:
+            remove_entity_if_disabled(
+                hass,
+                entry,
+                "camera",
+                OPT_EXPOSE_CAMERAS,
+                camera.unique_id,
+                default=True,
+            )
+        return
+    async_add_entities(cameras)
 
 
 class HomePlusSecurityEventCamera(CoordinatorEntity, Camera):

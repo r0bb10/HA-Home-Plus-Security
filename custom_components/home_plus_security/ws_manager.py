@@ -164,8 +164,9 @@ class HomePlusSecurityWsManager:
         """Process a push message without logging sensitive payload contents."""
         if not isinstance(payload, dict) or not isinstance(payload.get("extra_params"), dict):
             return False
-        if await self._coordinator.async_process_push_message(payload):
-            self._coordinator.async_request_refresh()
+        await self._coordinator.async_process_push_message(payload)
+        # Push messages can accompany device state changes but carry no telemetry.
+        self._coordinator.async_request_refresh()
         self._coordinator.note_ws_application_message()
         return True
 

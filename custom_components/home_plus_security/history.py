@@ -32,9 +32,20 @@ _MIME_SUFFIXES = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".web
 class HomePlusSecurityEventHistory:
     """Persist a bounded set of push event images and metadata."""
 
-    def __init__(self, hass: HomeAssistant, entry_id: str) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry_id: str,
+        *,
+        enabled: bool,
+        retention_days: int,
+        max_events: int,
+    ) -> None:
         self._hass = hass
         self._entry_id = entry_id
+        self._enabled = enabled
+        self._retention_days = retention_days
+        self._max_events = max_events
         self._store: Store[dict[str, Any]] = Store(
             hass, HISTORY_STORAGE_VERSION, f"{DOMAIN}.history.{entry_id}"
         )
@@ -47,10 +58,15 @@ class HomePlusSecurityEventHistory:
         """Load metadata and create the storage root once."""
         if self._loaded:
             return
+        if not self._enabled:
+            self._loaded = True
+            return
         data = await self._store.async_load()
         if isinstance(data, dict) and isinstance(data.get("events"), list):
             self._events = [event for event in data["events"] if isinstance(event, dict)]
         await self._hass.async_add_executor_job(self._root.mkdir, 0o700, True, True)
+        await self._async_apply_retention_locked()
+        await self._store.async_save({"events": self._events})
         self._loaded = True
 
     async def async_record_images(
@@ -63,6 +79,14 @@ class HomePlusSecurityEventHistory:
         vignette_url: str | None,
     ) -> dict[str, Any]:
         """Store newly received event images before their signed URLs expire."""
+        if not self._enabled:
+            return {
+                "event_id": event_id,
+                "module_id": module_id,
+                "timestamp": timestamp,
+                "snapshot_file": None,
+                "vignette_file": None,
+            }
         await self.async_load()
         async with self._lock:
             record = next((item for item in self._events if item.get("event_id") == event_id), None)
@@ -195,11 +219,11 @@ class HomePlusSecurityEventHistory:
         return filename, content_type, len(content), hashlib.sha256(content).hexdigest()
 
     async def _async_apply_retention_locked(self) -> None:
-        cutoff = (datetime.now(UTC) - timedelta(days=HISTORY_RETENTION_DAYS)).timestamp()
+        cutoff = (datetime.now(UTC) - timedelta(days=self._retention_days)).timestamp()
         retained: list[dict[str, Any]] = []
         removed: list[dict[str, Any]] = []
         for event in sorted(self._events, key=lambda item: item.get("timestamp") or 0, reverse=True):
-            if len(retained) < HISTORY_MAX_EVENTS and (event.get("timestamp") or 0) >= cutoff:
+            if len(retained) < self._max_events and (event.get("timestamp") or 0) >= cutoff:
                 retained.append(event)
             else:
                 removed.append(event)

@@ -29,5 +29,21 @@
       "cannot_connect": "Could not connect to Home + Security endpoints.",
       "no_bncx_homes": "No home with a Classe 300EOS (BNCX) module was found on this account."
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Home + Security options",
+        "description": "Choose retained event history and optional diagnostic entities.",
+        "data": {
+          "history_enabled": "Store event images and history",
+          "expose_unlock": "Expose unlock button",
+          "expose_cameras": "Expose camera and image entities",
+          "history_retention_days": "History retention",
+          "history_max_events": "Maximum retained events",
+          "diagnostics": "Diagnostic entities"
+        }
+      }
+    }
   }
 }

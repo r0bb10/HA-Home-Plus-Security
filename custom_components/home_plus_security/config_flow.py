@@ -9,7 +9,7 @@ from typing import Any
 from aiohttp import ClientError
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigEntry, ConfigFlowResult
+from homeassistant.config_entries import ConfigEntry, ConfigFlowResult, OptionsFlowWithReload
 from homeassistant.core import callback
 from homeassistant.helpers import config_entry_oauth2_flow
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -17,7 +17,14 @@ from homeassistant.helpers.config_entry_oauth2_flow import (
     LocalOAuth2Implementation,
     OAuth2TokenRequestError,
 )
-from homeassistant.helpers.selector import SelectSelector, SelectSelectorConfig
+from homeassistant.helpers.selector import (
+    BooleanSelector,
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
+    SelectSelector,
+    SelectSelectorConfig,
+)
 
 from .api import (
     HomePlusSecurityApiClient,
@@ -48,8 +55,29 @@ from .const import (
     DEFAULT_SYNC_API_BASE_URL,
     DEFAULT_TOKEN_URL,
     DEFAULT_TURN_API_BASE_URL,
+    DEFAULT_DIAGNOSTICS,
+    DIAGNOSTIC_CONNECTION_TYPE,
+    DIAGNOSTIC_DEVICE_REACHABLE,
     DOMAIN,
     NAME,
+    DIAGNOSTIC_DEVICE_STATUS_UPDATED,
+    DIAGNOSTIC_DEVICE_WEBSOCKET,
+    DIAGNOSTIC_LAST_COMMAND_ERROR,
+    DIAGNOSTIC_LOCAL_IP,
+    DIAGNOSTIC_PUSH_WEBSOCKET,
+    DIAGNOSTIC_WEBSOCKET_LAST_MESSAGE,
+    DIAGNOSTIC_WEBSOCKET_STALE,
+    DIAGNOSTIC_UPTIME,
+    DIAGNOSTIC_WIFI_STRENGTH,
+    HISTORY_MAX_EVENTS,
+    HISTORY_RETENTION_DAYS,
+    OPT_DIAGNOSTICS,
+    OPT_DIAGNOSTICS_CONFIGURED,
+    OPT_EXPOSE_CAMERAS,
+    OPT_EXPOSE_UNLOCK,
+    OPT_HISTORY_ENABLED,
+    OPT_HISTORY_MAX_EVENTS,
+    OPT_HISTORY_RETENTION_DAYS,
     REQUIRED_SECURITY_SCOPE,
 )
 
@@ -57,6 +85,19 @@ _LOGGER = logging.getLogger(__name__)
 APP_AUTHORIZE_URL = "https://app.netatmo.net/oauth2/authorize"
 _IMPL_KEY = f"{DOMAIN}_local"
 _DATA_LOCAL_IMPL_REGISTERED = f"{DOMAIN}_local_impl_registered"
+_DIAGNOSTIC_OPTIONS = [
+    {"value": DIAGNOSTIC_DEVICE_REACHABLE, "label": "Device reachable"},
+    {"value": DIAGNOSTIC_CONNECTION_TYPE, "label": "Connection type"},
+    {"value": DIAGNOSTIC_WIFI_STRENGTH, "label": "WiFi strength"},
+    {"value": DIAGNOSTIC_UPTIME, "label": "Uptime"},
+    {"value": DIAGNOSTIC_DEVICE_STATUS_UPDATED, "label": "Device status updated"},
+    {"value": DIAGNOSTIC_DEVICE_WEBSOCKET, "label": "Device WebSocket"},
+    {"value": DIAGNOSTIC_LOCAL_IP, "label": "Local IP address"},
+    {"value": DIAGNOSTIC_PUSH_WEBSOCKET, "label": "Push WebSocket"},
+    {"value": DIAGNOSTIC_WEBSOCKET_STALE, "label": "WebSocket stale"},
+    {"value": DIAGNOSTIC_WEBSOCKET_LAST_MESSAGE, "label": "WebSocket last message"},
+    {"value": DIAGNOSTIC_LAST_COMMAND_ERROR, "label": "Last command error"},
+]
 
 
 class HomePlusSecurityOAuth2Implementation(LocalOAuth2Implementation):
@@ -74,6 +115,69 @@ class HomePlusSecurityOAuth2Implementation(LocalOAuth2Implementation):
             "scope": DEFAULT_SCOPE,
             "app_type": DEFAULT_APP_TYPE,
         }
+
+
+class HomePlusSecurityOptionsFlow(OptionsFlowWithReload):
+    """Manage Home + Security options."""
+
+    async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """Show the integration options form."""
+        if user_input is not None:
+            user_input[OPT_DIAGNOSTICS_CONFIGURED] = True
+            return self.async_create_entry(title="", data=user_input)
+
+        options = self.config_entry.options
+        diagnostics = (
+            options.get(OPT_DIAGNOSTICS, [])
+            if options.get(OPT_DIAGNOSTICS_CONFIGURED) is True
+            else DEFAULT_DIAGNOSTICS
+        )
+        if not isinstance(diagnostics, list):
+            diagnostics = []
+        schema = vol.Schema(
+            {
+                vol.Required(
+                    OPT_HISTORY_ENABLED,
+                    default=options.get(OPT_HISTORY_ENABLED, True),
+                ): BooleanSelector(),
+                vol.Required(
+                    OPT_EXPOSE_UNLOCK,
+                    default=options.get(OPT_EXPOSE_UNLOCK, True),
+                ): BooleanSelector(),
+                vol.Required(
+                    OPT_EXPOSE_CAMERAS,
+                    default=options.get(OPT_EXPOSE_CAMERAS, True),
+                ): BooleanSelector(),
+                vol.Required(
+                    OPT_HISTORY_RETENTION_DAYS,
+                    default=options.get(OPT_HISTORY_RETENTION_DAYS, HISTORY_RETENTION_DAYS),
+                ): NumberSelector(
+                    NumberSelectorConfig(
+                        min=1,
+                        max=365,
+                        step=1,
+                        mode=NumberSelectorMode.BOX,
+                        unit_of_measurement="days",
+                    )
+                ),
+                vol.Required(
+                    OPT_HISTORY_MAX_EVENTS,
+                    default=options.get(OPT_HISTORY_MAX_EVENTS, HISTORY_MAX_EVENTS),
+                ): NumberSelector(
+                    NumberSelectorConfig(
+                        min=1,
+                        max=500,
+                        step=1,
+                        mode=NumberSelectorMode.BOX,
+                        unit_of_measurement="events",
+                    )
+                ),
+                vol.Required(OPT_DIAGNOSTICS, default=diagnostics): SelectSelector(
+                    SelectSelectorConfig(options=_DIAGNOSTIC_OPTIONS, multiple=True)
+                ),
+            }
+        )
+        return self.async_show_form(step_id="init", data_schema=schema)
 
 
 class HomePlusSecurityFlowHandler(
@@ -95,6 +199,12 @@ class HomePlusSecurityFlowHandler(
     def logger(self) -> logging.Logger:
         """Return logger."""
         return _LOGGER
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> HomePlusSecurityOptionsFlow:
+        """Return the options flow handler."""
+        return HomePlusSecurityOptionsFlow()
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
